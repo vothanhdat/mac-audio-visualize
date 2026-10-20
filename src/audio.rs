@@ -91,6 +91,15 @@ enum Capture {
 }
 
 impl AudioInput {
+    pub fn output_latency_ms(&mut self) -> Option<f32> {
+        match &mut self._capture {
+            #[cfg(target_os = "macos")]
+            Capture::System { _stream } => _stream.output_latency_ms(),
+            // Input devices may already be routed/synchronized externally.
+            Capture::Device { .. } => None,
+        }
+    }
+
     pub fn system() -> Result<Self> {
         #[cfg(target_os = "macos")]
         {

@@ -60,6 +60,21 @@ changing output devices or sample rates if capture stops or the spectrum becomes
 miscalibrated; automatic tap rebuilding is not implemented. Protected audio may
 be unavailable to system capture.
 
+Bluetooth playback can reach your ears later than the captured samples. Native
+system capture now enables **Auto sync to audio output** by default, delaying
+analysis by macOS's reported output device latency, stream latency, safety
+offset, and buffer duration. The estimate is refreshed once per second to follow
+output changes. This queries properties outside the real-time audio callback.
+
+Right-click the visualizer and open the **UI** tab to see the estimate and applied
+delay. Use **Sync adjustment** to fine-tune: positive values delay the visuals
+further, negative values reduce automatic compensation. Total visual delay is
+limited to 0–1,000 ms. Bluetooth firmware/codec buffering may differ from the
+reported estimate, so fine-tuning may still be needed. Existing manual delay
+settings are retained as an adjustment; switch off automatic sync if you want
+to retain an already calibrated manual delay. For `--device` capture, the
+automatic estimate is unavailable and only the manual adjustment applies.
+
 ## Optional input-device / BlackHole routing
 
 Use `--device NAME` for an existing loopback device or microphone through CPAL.
@@ -96,7 +111,8 @@ show and focus it, and **Esc** to quit.
 
 The in-window controls apply immediately without shader recompilation. They
 include visual gain, optional attack and decay smoothing for all five frequency
-bands, adjustable bar brightness and peak indicators, a 0–1,000 ms visual delay
+bands, adjustable bar brightness and peak indicators, automatic output latency
+compensation with an adjustable 0–1,000 ms total visual delay
 for output-device synchronization, global and independent per-band DFT sample
 sizes, fixed pixel bar width, adjustable 0–12 px bar spacing with a
 resize-responsive bar count, and a reset

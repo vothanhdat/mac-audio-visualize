@@ -208,11 +208,12 @@ impl ApplicationHandler for App {
                 {
                     return;
                 }
+                let output_latency_ms = self.audio.output_latency_ms();
                 match self
                     .gpu
                     .as_mut()
                     .unwrap()
-                    .render_visualizer(&self.audio.ring)
+                    .render_visualizer(&self.audio.ring, output_latency_ms)
                 {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {

@@ -18,6 +18,52 @@ typedef struct {
     void *context;
 } VACapture;
 
+static OSStatus read_property(AudioObjectID object, AudioObjectPropertySelector selector,
+                               AudioObjectPropertyScope scope, void *value, UInt32 size) {
+    AudioObjectPropertyAddress address = {selector, scope, kAudioObjectPropertyElementMain};
+    return AudioObjectGetPropertyData(object, &address, 0, NULL, &size, value);
+}
+
+// Called on the UI thread at most once per second, never in the audio callback.
+// Negative means unavailable; device and stream latency are additive per Core Audio.
+double va_output_latency_ms(void) {
+    AudioObjectID device = kAudioObjectUnknown;
+    if (read_property(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+                      kAudioObjectPropertyScopeGlobal, &device, sizeof(device)) != noErr ||
+        device == kAudioObjectUnknown) return -1;
+    Float64 rate = 0;
+    UInt32 deviceLatency = 0, safety = 0, buffer = 0, streamLatency = 0;
+    if (read_property(device, kAudioDevicePropertyNominalSampleRate,
+                      kAudioObjectPropertyScopeGlobal, &rate, sizeof(rate)) != noErr ||
+        !isfinite(rate) || rate <= 0 ||
+        read_property(device, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeOutput,
+                      &deviceLatency, sizeof(deviceLatency)) != noErr) return -1;
+    read_property(device, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeOutput,
+                  &safety, sizeof(safety));
+    read_property(device, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal,
+                  &buffer, sizeof(buffer));
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyStreams,
+        kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &address, 0, NULL, &size) == noErr && size > 0) {
+        AudioStreamID *streams = malloc(size);
+        if (streams) {
+            UInt32 capacity = size;
+            if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, streams) == noErr &&
+                size <= capacity) {
+                for (UInt32 index = 0; index < size / sizeof(AudioStreamID); ++index) {
+                    UInt32 latency = 0;
+                    read_property(streams[index], kAudioStreamPropertyLatency,
+                                  kAudioObjectPropertyScopeGlobal, &latency, sizeof(latency));
+                    if (latency > streamLatency) streamLatency = latency;
+                }
+            }
+            free(streams);
+        }
+    }
+    return 1000.0 * ((double)deviceLatency + streamLatency + safety + buffer) / rate;
+}
+
 void va_capture_close(VACapture *capture) {
     if (!capture) return;
     if (@available(macOS 14.2, *)) {

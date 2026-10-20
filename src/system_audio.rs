@@ -2,6 +2,7 @@ use std::{
     ffi::{CStr, c_char, c_void},
     ptr::NonNull,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
@@ -20,12 +21,15 @@ unsafe extern "C" {
         error_size: usize,
     ) -> *mut c_void;
     fn va_capture_close(capture: *mut c_void);
+    fn va_output_latency_ms() -> f64;
 }
 
 pub(super) struct SystemAudio {
     capture: NonNull<c_void>,
     // The stable Arc allocation stays alive until the native IOProc has stopped.
     _ring: Arc<SampleRing>,
+    latency_checked_at: Option<Instant>,
+    output_latency_ms: Option<f32>,
 }
 
 impl SystemAudio {
@@ -54,10 +58,30 @@ impl SystemAudio {
             Self {
                 capture,
                 _ring: ring,
+                latency_checked_at: None,
+                output_latency_ms: None,
             },
             sample_rate,
             channels,
         ))
+    }
+
+    pub(super) fn output_latency_ms(&mut self) -> Option<f32> {
+        let now = Instant::now();
+        if self
+            .latency_checked_at
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        {
+            // SAFETY: this queries Core Audio properties and retains no Rust pointers.
+            let latency = unsafe { va_output_latency_ms() };
+            self.output_latency_ms = if latency.is_finite() && latency >= 0.0 {
+                Some(latency.min(1000.0) as f32)
+            } else {
+                None
+            };
+            self.latency_checked_at = Some(now);
+        }
+        self.output_latency_ms
     }
 }
 

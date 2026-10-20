@@ -125,6 +125,7 @@ struct VisualizerSettings {
     decays: [f32; 5],
     temporal_smoothing: bool,
     visualization_delay_ms: f32,
+    auto_output_sync: bool,
     min_brightness: f32,
     max_brightness: f32,
     rise_highlight: bool,
@@ -444,6 +445,7 @@ impl Default for VisualizerSettings {
             decays: [0.56, 0.66, 0.78, 0.84, 0.87],
             temporal_smoothing: false,
             visualization_delay_ms: 0.0,
+            auto_output_sync: true,
             min_brightness: 0.02,
             max_brightness: 5.3,
             rise_highlight: true,
@@ -588,7 +590,7 @@ impl VisualizerSettings {
         self.visualization_delay_ms = finite_clamp(
             self.visualization_delay_ms,
             defaults.visualization_delay_ms,
-            0.0,
+            -1000.0,
             1000.0,
         );
         self.min_brightness = finite_clamp(self.min_brightness, defaults.min_brightness, 0.02, 1.0);
@@ -1075,11 +1077,18 @@ impl UiLayer {
         render_size: PhysicalSize<u32>,
         settings: &mut VisualizerSettings,
         sample_rate: f32,
+        output_latency_ms: Option<f32>,
     ) -> UiFrame {
         let input = self.state.take_egui_input(window);
         let context = self.context.clone();
         let output = context.run(input, |context| {
-            draw_settings_panel(context, settings, sample_rate, &mut self.settings_tab);
+            draw_settings_panel(
+                context,
+                settings,
+                sample_rate,
+                output_latency_ms,
+                &mut self.settings_tab,
+            );
         });
         self.state
             .handle_platform_output(window, output.platform_output);
@@ -1095,10 +1104,20 @@ impl UiLayer {
     }
 }
 
+fn visual_delay_ms(settings: &VisualizerSettings, output_latency_ms: Option<f32>) -> f32 {
+    let automatic = if settings.auto_output_sync {
+        output_latency_ms.unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    (automatic + settings.visualization_delay_ms).clamp(0.0, 1000.0)
+}
+
 fn draw_settings_panel(
     context: &egui::Context,
     settings: &mut VisualizerSettings,
     sample_rate: f32,
+    output_latency_ms: Option<f32>,
     settings_tab: &mut SettingsTab,
 ) {
     egui::CentralPanel::default().show(context, |ui| {
@@ -1964,12 +1983,21 @@ fn draw_settings_panel(
                 );
                     }
                     SettingsTab::Visual => {
+                ui.checkbox(&mut settings.auto_output_sync, "Auto sync to audio output");
                 ui.add(
-                    egui::Slider::new(&mut settings.visualization_delay_ms, 0.0..=1000.0)
+                    egui::Slider::new(&mut settings.visualization_delay_ms, -1000.0..=1000.0)
                         .step_by(1.0)
                         .suffix(" ms")
-                        .text("Visual delay"),
+                        .text("Sync adjustment"),
                 );
+                let automatic = if settings.auto_output_sync { output_latency_ms } else { None };
+                ui.small(match automatic {
+                    Some(ms) => format!("Output latency estimate: {ms:.0} ms"),
+                    None if settings.auto_output_sync => "Output latency unavailable; using manual adjustment.".to_owned(),
+                    None => "Automatic output sync is off.".to_owned(),
+                });
+                ui.small(format!("Applied visual delay: {:.0} ms", visual_delay_ms(settings, output_latency_ms)));
+                ui.small("Increase adjustment if visuals lead the sound; decrease if they lag.");
                 ui.separator();
                 ui.label("Frequency range");
                 ui.add(
@@ -2513,6 +2541,7 @@ pub struct GpuState {
     right_history: Vec<f32>,
     sample_rate: f32,
     started: Instant,
+    output_latency_ms: Option<f32>,
     last_frame: Instant,
     last_bin_count: u32,
     last_db_floors: [f32; 2],
@@ -3513,6 +3542,7 @@ impl GpuState {
             left_history: vec![0.0; history_sample_count],
             right_history: vec![0.0; history_sample_count],
             sample_rate: sample_rate as f32,
+            output_latency_ms: None,
             started: Instant::now(),
             last_frame: Instant::now(),
             last_bin_count: initial_bin_count,
@@ -3697,7 +3727,12 @@ impl GpuState {
         self.ui.on_event(window, event)
     }
 
-    pub fn render_visualizer(&mut self, ring: &SampleRing) -> Result<(), wgpu::SurfaceError> {
+    pub fn render_visualizer(
+        &mut self,
+        ring: &SampleRing,
+        output_latency_ms: Option<f32>,
+    ) -> Result<(), wgpu::SurfaceError> {
+        self.output_latency_ms = output_latency_ms;
         self.save_settings_if_due();
         self.apply_pending_resize();
         self.apply_surface_history_size();
@@ -3729,8 +3764,9 @@ impl GpuState {
                 ChannelMode::Left => unreachable!(),
             }
         }
-        let requested_delay =
-            (self.settings.visualization_delay_ms * self.sample_rate / 1000.0).round() as usize;
+        let requested_delay = (visual_delay_ms(&self.settings, self.output_latency_ms)
+            * self.sample_rate / 1000.0)
+            .round() as usize;
         let history_sample_count = self.left_history.len();
         let resonator_alignment_delay = if matches!(
             self.settings.analysis_method,
@@ -4470,6 +4506,7 @@ impl GpuState {
             self.controls_size,
             &mut self.settings,
             self.sample_rate,
+            self.output_latency_ms,
         );
         if self.settings != settings_before {
             self.mark_settings_dirty();
@@ -5248,7 +5285,7 @@ fn compute_pipeline(
 
 #[cfg(test)]
 mod tests {
-    use super::{BarLayout, VisualizerSettings, display_bin_count};
+    use super::{BarLayout, VisualizerSettings, display_bin_count, visual_delay_ms};
     use winit::dpi::PhysicalSize;
 
     #[test]
@@ -5257,6 +5294,29 @@ mod tests {
         let json = serde_json::to_string(&expected).unwrap();
         let actual: VisualizerSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn output_sync_combines_reported_latency_and_signed_adjustment() {
+        let mut settings = VisualizerSettings::default();
+        assert_eq!(visual_delay_ms(&settings, Some(240.0)), 240.0);
+        settings.visualization_delay_ms = -40.0;
+        assert_eq!(visual_delay_ms(&settings, Some(240.0)), 200.0);
+        assert_eq!(visual_delay_ms(&settings, Some(10.0)), 0.0);
+        settings.visualization_delay_ms = 900.0;
+        assert_eq!(visual_delay_ms(&settings, Some(240.0)), 1000.0);
+        settings.auto_output_sync = false;
+        assert_eq!(visual_delay_ms(&settings, Some(240.0)), 900.0);
+        settings.auto_output_sync = true;
+        assert_eq!(visual_delay_ms(&settings, None), 900.0);
+    }
+
+    #[test]
+    fn existing_settings_enable_output_sync_without_losing_manual_delay() {
+        let settings: VisualizerSettings =
+            serde_json::from_str(r#"{"visualization_delay_ms":150.0}"#).unwrap();
+        assert!(settings.auto_output_sync);
+        assert_eq!(visual_delay_ms(&settings, Some(100.0)), 250.0);
     }
 
     #[test]

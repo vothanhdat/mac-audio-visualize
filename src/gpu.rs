@@ -19,10 +19,9 @@ use crate::{
     resonator_resampler::ResonatorResampler,
 };
 
-// Reserve enough recent audio for the largest selectable (2x) DFT windows.
+// Audio block used for streaming analyzer warm-up and output-delay alignment.
 pub const SAMPLE_COUNT: usize = 16_384;
 const HISTORY_SAMPLE_COUNT: usize = 65_536;
-const MAX_MULTIRATE_MAGNITUDE_COUNT: usize = 5 * (8192 / 2 + 1);
 const MAX_BIN_COUNT: u32 = 2048;
 const GAMMATONE_WARMUP_SAMPLES: usize = 4096;
 const PLOT_HORIZONTAL_MARGIN: f32 = 0.0;
@@ -39,17 +38,11 @@ struct AnalysisParams {
     bin_count: u32,
     resolution: [f32; 2],
     axis_focus: [f32; 2],
-    attack_0: [f32; 4],
-    attack_1: [f32; 4],
-    decay_0: [f32; 4],
-    decay_1: [f32; 4],
     perception: [f32; 4],
     visual: [f32; 4],
-    sample_counts_0: [u32; 4],
-    sample_counts_1: [u32; 4],
+    capture: [u32; 4],
     db_scale: [f32; 4],
     frequency_range: [f32; 4],
-    frequency_smoothing: [f32; 4],
     auditory_0: [f32; 4],
     auditory_1: [f32; 4],
     fft_sizes_0: [u32; 4],
@@ -121,9 +114,6 @@ struct VisualizerSettings {
     gain: f32,
     channel_mode: ChannelMode,
     stereo_treble_center: bool,
-    attacks: [f32; 5],
-    decays: [f32; 5],
-    temporal_smoothing: bool,
     visualization_delay_ms: f32,
     auto_output_sync: bool,
     min_brightness: f32,
@@ -137,24 +127,16 @@ struct VisualizerSettings {
     peak_gravity_db_per_second2: f32,
     peak_momentum: bool,
     analysis_method: AnalysisMethod,
-    analysis_window: AnalysisWindow,
-    sample_counts: [u32; 5],
-    adaptive_dual_window: bool,
-    adaptive_triple_window: bool,
-    adaptive_response_percent: f32,
     asymmetric_kaiser_beta: f32,
     flanagan_alpha: f32,
     multirate_fft_window: AnalysisWindow,
     multirate_fft_sizes: [u32; 3],
     multirate_fft_decimations: [u32; 3],
     multirate_fft_crossovers_hz: [f32; 2],
-    multirate_fft_analysis_rate_hz: f32,
     multirate_fft5_window: AnalysisWindow,
     multirate_fft5_sizes: [u32; 5],
     multirate_fft5_decimations: [u32; 5],
     multirate_fft5_crossovers_hz: [f32; 4],
-    multirate_fft5_analysis_rate_hz: f32,
-    fft_sync_to_display: bool,
     auditory_erb_bandwidth_scale: f32,
     auditory_compression_percent: f32,
     auditory_filter_order: u32,
@@ -164,9 +146,6 @@ struct VisualizerSettings {
     auditory_tonal_width_10_khz_percent: Option<f32>,
     resonator_q_50_hz: f32,
     resonator_q_10_khz: f32,
-    resonator_stage_count: u32,
-    resonator_two_stage_q_percent: f32,
-    resonator_transient_assist_percent: f32,
     resonator_measurement: ResonatorMeasurement,
     resonator_envelope: ResonatorEnvelope,
     resonator_decay_db: f32,
@@ -178,9 +157,7 @@ struct VisualizerSettings {
     #[serde(alias = "hybrid_fft_size")]
     hybrid_half_fft_size: u32,
     hybrid_full_fft_size: u32,
-    hybrid_analysis_rate_hz: f32,
-    hybrid_half_fft_gain_db: f32,
-    hybrid_full_fft_gain_db: f32,
+    fft_display_divisor: u32,
     hybrid_adaptive_matching: bool,
     hybrid_match_adapt_seconds: f32,
     hybrid_match_max_correction_db: f32,
@@ -226,18 +203,14 @@ struct VisualizerSettings {
     max_frequency_hz: f32,
     frequency_focus_strength_percent: f32,
     frequency_focus_origin_percent: f32,
-    frequency_smoothing_strength_percent: f32,
-    frequency_smoothing_50_hz_octaves: f32,
-    frequency_smoothing_10_khz_octaves: f32,
-    frequency_smoothing_max_lift_db: f32,
     transparent_background: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum AnalysisMethod {
-    WindowedDft,
     MultirateFft,
     MultirateFft5,
+    #[serde(alias = "WindowedDft")]
     ResonatorBank,
     HybridResonatorFft,
     AuditoryErb,
@@ -368,7 +341,6 @@ impl ResonatorEnvelope {
 impl AnalysisMethod {
     fn label(self) -> &'static str {
         match self {
-            Self::WindowedDft => "Adaptive DFT",
             Self::MultirateFft => "Multirate FFT (3-band)",
             Self::MultirateFft5 => "Multirate FFT (5-band)",
             Self::ResonatorBank => "Resonator bank",
@@ -438,12 +410,9 @@ struct UiFrame {
 impl Default for VisualizerSettings {
     fn default() -> Self {
         Self {
-            gain: 15.0,
+            gain: 1.7,
             channel_mode: ChannelMode::Mono,
             stereo_treble_center: false,
-            attacks: [0.12, 0.18, 0.20, 0.32, 0.36],
-            decays: [0.56, 0.66, 0.78, 0.84, 0.87],
-            temporal_smoothing: false,
             visualization_delay_ms: 0.0,
             auto_output_sync: true,
             min_brightness: 0.02,
@@ -455,52 +424,39 @@ impl Default for VisualizerSettings {
             bar_gravity_db_per_second2: 5000.0,
             peak_hold_ms: 120.0,
             peak_gravity_db_per_second2: 45.0,
-            peak_momentum: false,
+            peak_momentum: true,
             analysis_method: AnalysisMethod::HybridResonatorFft,
-            analysis_window: AnalysisWindow::HalfBlackman,
-            sample_counts: [128, 256, 512, 1024, 2048],
-            adaptive_dual_window: false,
-            adaptive_triple_window: false,
-            adaptive_response_percent: 50.0,
-            asymmetric_kaiser_beta: 8.0,
+            asymmetric_kaiser_beta: 8.1,
             flanagan_alpha: 8.0,
             multirate_fft_window: AnalysisWindow::HalfBlackman,
             multirate_fft_sizes: [128, 512, 2048],
             multirate_fft_decimations: [64, 8, 1],
-            multirate_fft_crossovers_hz: [200.0, 2000.0],
-            multirate_fft_analysis_rate_hz: 120.0,
-            multirate_fft5_window: AnalysisWindow::HalfBlackman,
+            multirate_fft_crossovers_hz: [230.0, 2200.0],
+            multirate_fft5_window: AnalysisWindow::AsymmetricKaiser8,
             multirate_fft5_sizes: [128, 256, 512, 1024, 2048],
             multirate_fft5_decimations: [128, 64, 16, 4, 1],
             multirate_fft5_crossovers_hz: [80.0, 320.0, 1280.0, 5120.0],
-            multirate_fft5_analysis_rate_hz: 120.0,
-            fft_sync_to_display: true,
-            auditory_erb_bandwidth_scale: 1.0,
-            auditory_compression_percent: 35.0,
-            auditory_filter_order: 2,
-            auditory_phase_sharpening_percent: 75.0,
-            auditory_phase_sharpening_10_khz_percent: None,
-            auditory_tonal_width_percent: 15.0,
-            auditory_tonal_width_10_khz_percent: None,
+            auditory_erb_bandwidth_scale: 0.5,
+            auditory_compression_percent: 0.0,
+            auditory_filter_order: 4,
+            auditory_phase_sharpening_percent: 100.0,
+            auditory_phase_sharpening_10_khz_percent: Some(100.0),
+            auditory_tonal_width_percent: 85.0,
+            auditory_tonal_width_10_khz_percent: Some(8.0),
             resonator_q_50_hz: 10.0,
-            resonator_q_10_khz: 300.0,
-            resonator_stage_count: 2,
-            resonator_two_stage_q_percent: 64.4,
-            resonator_transient_assist_percent: 70.0,
+            resonator_q_10_khz: 200.0,
             resonator_measurement: ResonatorMeasurement::ImageRejected,
-            resonator_envelope: ResonatorEnvelope::DecayThenPeak,
-            resonator_decay_db: 53.0,
-            resonator_decay_seconds: 0.37,
+            resonator_envelope: ResonatorEnvelope::PeakThenDecay,
+            resonator_decay_db: 60.0,
+            resonator_decay_seconds: 0.3,
             resonator_multirate: true,
-            resonator_five_stage: false,
-            resonator_timestamp_alignment: false,
+            resonator_five_stage: true,
+            resonator_timestamp_alignment: true,
             hybrid_fft_window: AnalysisWindow::AsymmetricKaiser8,
             hybrid_half_fft_size: 1024,
             hybrid_full_fft_size: 512,
-            hybrid_analysis_rate_hz: 120.0,
-            hybrid_half_fft_gain_db: 4.7,
-            hybrid_full_fft_gain_db: -5.0,
-            hybrid_adaptive_matching: false,
+            fft_display_divisor: 1,
+            hybrid_adaptive_matching: true,
             hybrid_match_adapt_seconds: 1.0,
             hybrid_match_max_correction_db: 12.0,
             render_mode: RenderMode::Flat,
@@ -508,7 +464,7 @@ impl Default for VisualizerSettings {
             surface_camera_distance: 3.0,
             surface_camera_fov_degrees: 50.0,
             surface_camera_target_y: 0.45,
-            surface_bar_depth_px: Some(6.0),
+            surface_bar_depth_px: Some(1.0),
             surface_bar_depth_percent: 100.0,
             surface_peak_depth_brightness_percent: 55.0,
             surface_volume_stage_count: 5,
@@ -527,26 +483,22 @@ impl Default for VisualizerSettings {
             surface_peak_trail_opacity_percent: 70.0,
             surface_peak_trail_capture_interval_frames: 1,
             axis_labels_overlay: false,
-            axis_label_mode: AxisLabelMode::Notes,
+            axis_label_mode: AxisLabelMode::Hertz,
             show_frequency_grid: true,
-            bottom_mirror: false,
-            mirror_baseline_percent: 50.0,
-            mirror_initial_fade_percent: 0.0,
-            mirror_fade_percent: 0.0,
+            bottom_mirror: true,
+            mirror_baseline_percent: 82.0,
+            mirror_initial_fade_percent: 43.0,
+            mirror_fade_percent: 2000.0,
             bar_layout: BarLayout::FixedPixels,
-            bar_width_px: 1.0,
+            bar_width_px: 3.0,
             bar_spacing_px: 0.0,
-            low_db_floor: -56.0,
-            high_db_floor: -78.0,
-            bar_top_fade_percent: 34.0,
-            min_frequency_hz: 35.0,
-            max_frequency_hz: 22_000.0,
-            frequency_focus_strength_percent: 50.0,
+            low_db_floor: -51.0,
+            high_db_floor: -62.0,
+            bar_top_fade_percent: 45.0,
+            min_frequency_hz: 16.0,
+            max_frequency_hz: 22500.0,
+            frequency_focus_strength_percent: 59.0,
             frequency_focus_origin_percent: 50.0,
-            frequency_smoothing_strength_percent: 0.0,
-            frequency_smoothing_50_hz_octaves: 1.0 / 48.0,
-            frequency_smoothing_10_khz_octaves: 1.0 / 12.0,
-            frequency_smoothing_max_lift_db: 8.0,
             transparent_background: false,
         }
     }
@@ -586,6 +538,7 @@ impl VisualizerSettings {
 
     fn sanitized(mut self) -> Self {
         let defaults = Self::default();
+        self.fft_display_divisor = self.fft_display_divisor.clamp(1, 4);
         self.gain = finite_clamp(self.gain, defaults.gain, 0.1, 20.0);
         self.visualization_delay_ms = finite_clamp(
             self.visualization_delay_ms,
@@ -679,36 +632,6 @@ impl VisualizerSettings {
             0.0,
             100.0,
         );
-        self.frequency_smoothing_strength_percent = finite_clamp(
-            self.frequency_smoothing_strength_percent,
-            defaults.frequency_smoothing_strength_percent,
-            0.0,
-            100.0,
-        );
-        self.frequency_smoothing_50_hz_octaves = finite_clamp(
-            self.frequency_smoothing_50_hz_octaves,
-            defaults.frequency_smoothing_50_hz_octaves,
-            1.0 / 192.0,
-            1.0,
-        );
-        self.frequency_smoothing_10_khz_octaves = finite_clamp(
-            self.frequency_smoothing_10_khz_octaves,
-            defaults.frequency_smoothing_10_khz_octaves,
-            1.0 / 192.0,
-            1.0,
-        );
-        self.frequency_smoothing_max_lift_db = finite_clamp(
-            self.frequency_smoothing_max_lift_db,
-            defaults.frequency_smoothing_max_lift_db,
-            0.5,
-            30.0,
-        );
-        self.adaptive_response_percent = finite_clamp(
-            self.adaptive_response_percent,
-            defaults.adaptive_response_percent,
-            0.0,
-            100.0,
-        );
         self.asymmetric_kaiser_beta = finite_clamp(
             self.asymmetric_kaiser_beta,
             defaults.asymmetric_kaiser_beta,
@@ -716,12 +639,6 @@ impl VisualizerSettings {
             16.0,
         );
         self.flanagan_alpha = finite_clamp(self.flanagan_alpha, defaults.flanagan_alpha, 2.0, 24.0);
-        self.multirate_fft_analysis_rate_hz = finite_clamp(
-            self.multirate_fft_analysis_rate_hz,
-            defaults.multirate_fft_analysis_rate_hz,
-            15.0,
-            240.0,
-        );
         for index in 0..3 {
             self.multirate_fft_decimations[index] = self.multirate_fft_decimations[index]
                 .clamp(1, 128)
@@ -747,12 +664,6 @@ impl VisualizerSettings {
             defaults.multirate_fft_crossovers_hz[1],
             (self.multirate_fft_crossovers_hz[0] * 1.2).max(500.0),
             10_000.0,
-        );
-        self.multirate_fft5_analysis_rate_hz = finite_clamp(
-            self.multirate_fft5_analysis_rate_hz,
-            defaults.multirate_fft5_analysis_rate_hz,
-            15.0,
-            240.0,
         );
         for index in 0..5 {
             self.multirate_fft5_decimations[index] = self.multirate_fft5_decimations[index]
@@ -838,19 +749,6 @@ impl VisualizerSettings {
             4.0,
             512.0,
         );
-        self.resonator_stage_count = self.resonator_stage_count.clamp(1, 2);
-        self.resonator_two_stage_q_percent = finite_clamp(
-            self.resonator_two_stage_q_percent,
-            defaults.resonator_two_stage_q_percent,
-            25.0,
-            125.0,
-        );
-        self.resonator_transient_assist_percent = finite_clamp(
-            self.resonator_transient_assist_percent,
-            defaults.resonator_transient_assist_percent,
-            0.0,
-            100.0,
-        );
         self.resonator_decay_db = finite_clamp(
             self.resonator_decay_db,
             defaults.resonator_decay_db,
@@ -871,24 +769,6 @@ impl VisualizerSettings {
             .hybrid_full_fft_size
             .clamp(128, 4096)
             .next_power_of_two();
-        self.hybrid_analysis_rate_hz = finite_clamp(
-            self.hybrid_analysis_rate_hz,
-            defaults.hybrid_analysis_rate_hz,
-            15.0,
-            240.0,
-        );
-        self.hybrid_half_fft_gain_db = finite_clamp(
-            self.hybrid_half_fft_gain_db,
-            defaults.hybrid_half_fft_gain_db,
-            -10.0,
-            10.0,
-        );
-        self.hybrid_full_fft_gain_db = finite_clamp(
-            self.hybrid_full_fft_gain_db,
-            defaults.hybrid_full_fft_gain_db,
-            -10.0,
-            10.0,
-        );
         self.hybrid_match_adapt_seconds = finite_clamp(
             self.hybrid_match_adapt_seconds,
             defaults.hybrid_match_adapt_seconds,
@@ -1003,18 +883,6 @@ impl VisualizerSettings {
         );
         self.surface_peak_trail_capture_interval_frames =
             self.surface_peak_trail_capture_interval_frames.clamp(1, 10);
-        for index in 0..5 {
-            self.attacks[index] =
-                finite_clamp(self.attacks[index], defaults.attacks[index], 0.0, 1.0);
-            self.decays[index] = finite_clamp(self.decays[index], defaults.decays[index], 0.0, 1.0);
-            self.sample_counts[index] = self.sample_counts[index].clamp(64, 4096);
-        }
-        if self.adaptive_dual_window || self.adaptive_triple_window {
-            self.sample_counts = [128, 256, 512, 1024, 2048];
-        }
-        if self.adaptive_triple_window {
-            self.adaptive_dual_window = false;
-        }
         self
     }
 }
@@ -1113,6 +981,27 @@ fn visual_delay_ms(settings: &VisualizerSettings, output_latency_ms: Option<f32>
     (automatic + settings.visualization_delay_ms).clamp(0.0, 1000.0)
 }
 
+fn fft_cadence_control(ui: &mut egui::Ui, settings: &mut VisualizerSettings) {
+    egui::ComboBox::from_label("FFT update rate")
+        .selected_text(match settings.fft_display_divisor {
+            2 => "½× display",
+            3 => "⅓× display",
+            4 => "¼× display",
+            _ => "1× display",
+        })
+        .show_ui(ui, |ui| {
+            for (divisor, label) in [
+                (1, "1× display"),
+                (2, "½× display"),
+                (3, "⅓× display"),
+                (4, "¼× display"),
+            ] {
+                ui.selectable_value(&mut settings.fft_display_divisor, divisor, label);
+            }
+        });
+    ui.small("Updates FFT every selected number of visual frames; bars and peaks still animate every frame.");
+}
+
 fn draw_settings_panel(
     context: &egui::Context,
     settings: &mut VisualizerSettings,
@@ -1164,7 +1053,6 @@ fn draw_settings_panel(
                     .selected_text(settings.analysis_method.label())
                     .show_ui(ui, |ui| {
                         for method in [
-                            AnalysisMethod::WindowedDft,
                             AnalysisMethod::MultirateFft,
                             AnalysisMethod::MultirateFft5,
                             AnalysisMethod::ResonatorBank,
@@ -1194,44 +1082,6 @@ fn draw_settings_panel(
                                 .text("Q at 10 kHz"),
                         );
                         ui.small("Q transitions smoothly in square-root frequency.");
-                        egui::ComboBox::from_label("Resonator stages")
-                            .selected_text(format!("{} stage", settings.resonator_stage_count))
-                            .show_ui(ui, |ui| {
-                                for count in 1..=2 {
-                                    ui.selectable_value(
-                                        &mut settings.resonator_stage_count,
-                                        count,
-                                        format!("{count} stage"),
-                                    );
-                                }
-                            });
-                        ui.small(
-                            "The second stage is cleaner while the first detects attacks.",
-                        );
-                        ui.add_enabled(
-                            settings.resonator_stage_count == 2,
-                            egui::Slider::new(
-                                &mut settings.resonator_two_stage_q_percent,
-                                25.0..=125.0,
-                            )
-                            .suffix("%")
-                            .text("Two-stage Q factor"),
-                        );
-                        ui.small(
-                            "64.4% preserves approximately the one-stage -3 dB bandwidth. Lower is faster/wider; higher is narrower/slower.",
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.resonator_transient_assist_percent,
-                                0.0..=100.0,
-                            )
-                            .suffix("%")
-                            .text("Transient assist"),
-                        );
-                        ui.small(match settings.resonator_stage_count {
-                            2 => "Boosts the first stage only when its corrected complex phase agrees with the clean second stage.",
-                            _ => "Adds a fast parallel attack detector. 0% restores the original single-resonator response.",
-                        });
                         egui::ComboBox::from_label("Level measurement")
                             .selected_text(settings.resonator_measurement.label())
                             .show_ui(ui, |ui| {
@@ -1256,7 +1106,7 @@ fn draw_settings_panel(
                         ui.small(
                             "Uses anti-aliased /2, /4, and /8 audio rates below 8, 4, and 1.8 kHz.",
                         );
-                        ui.add_enabled_ui(settings.resonator_multirate, |ui| {
+                        if settings.resonator_multirate {
                             ui.checkbox(
                                 &mut settings.resonator_five_stage,
                                 "Add fifth /16 stage",
@@ -1265,7 +1115,7 @@ fn draw_settings_panel(
                                 &mut settings.resonator_timestamp_alignment,
                                 "Align multirate timestamps",
                             );
-                        });
+                        }
                         ui.small(
                             "The optional /16 stage handles frequencies below about 0.9 kHz.",
                         );
@@ -1334,6 +1184,13 @@ fn draw_settings_panel(
                                     );
                                 }
                             });
+                        if settings.hybrid_fft_window == AnalysisWindow::AsymmetricKaiser8 {
+                            ui.add(egui::Slider::new(&mut settings.asymmetric_kaiser_beta, 0.0..=16.0)
+                                .step_by(0.1).text("Kaiser β"));
+                        } else if settings.hybrid_fft_window == AnalysisWindow::Flanagan {
+                            ui.add(egui::Slider::new(&mut settings.flanagan_alpha, 2.0..=24.0)
+                                .step_by(0.1).text("Flanagan α"));
+                        }
                         egui::ComboBox::from_label("/2 FFT size")
                             .selected_text(format!("{} samples", settings.hybrid_half_fft_size))
                             .show_ui(ui, |ui| {
@@ -1361,7 +1218,7 @@ fn draw_settings_panel(
                                 &mut settings.hybrid_adaptive_matching,
                                 "Match FFT levels to reference resonators",
                             );
-                            ui.add_enabled_ui(settings.hybrid_adaptive_matching, |ui| {
+                            if settings.hybrid_adaptive_matching {
                                 ui.add(
                                     egui::Slider::new(
                                         &mut settings.hybrid_match_adapt_seconds,
@@ -1393,52 +1250,12 @@ fn draw_settings_panel(
                                     format_frequency(references[4]),
                                     format_frequency(references[5]),
                                 ));
-                            });
+                            }
                             ui.small(
                                 "Matching is chained from the lower-frequency analyzer into each FFT band. Each band receives one stable correction, which pauses automatically below the noise floor.",
                             );
                         });
-                        ui.add_enabled_ui(!settings.hybrid_adaptive_matching, |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut settings.hybrid_half_fft_gain_db,
-                                    -10.0..=10.0,
-                                )
-                                .suffix(" dB")
-                                .text("/2 FFT level"),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut settings.hybrid_full_fft_gain_db,
-                                    -10.0..=10.0,
-                                )
-                                .suffix(" dB")
-                                .text("/1 FFT level"),
-                            );
-                        });
-                        if settings.hybrid_adaptive_matching {
-                            ui.small("Manual FFT levels are preserved and disabled while matching is active.");
-                        }
-                        ui.checkbox(
-                            &mut settings.fft_sync_to_display,
-                            "Sync FFT analysis to display",
-                        );
-                        ui.add_enabled_ui(!settings.fft_sync_to_display, |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut settings.hybrid_analysis_rate_hz,
-                                    15.0..=240.0,
-                                )
-                                .logarithmic(true)
-                                .suffix(" Hz")
-                                .text("FFT analysis rate"),
-                            );
-                        });
-                        ui.small(if settings.fft_sync_to_display {
-                            "Runs one FFT per presented frame when new audio is available."
-                        } else {
-                            "Uses the fixed FFT analysis rate."
-                        });
+                        fft_cadence_control(ui, settings);
                         ui.small(
                             "The /8 and /4 stages use resonators. The /2 and full-rate stages use FFT automatically.",
                         );
@@ -1555,26 +1372,7 @@ fn draw_settings_panel(
                                     .text("Flanagan α"),
                             );
                         }
-                        ui.checkbox(
-                            &mut settings.fft_sync_to_display,
-                            "Sync FFT analysis to display",
-                        );
-                        ui.add_enabled_ui(!settings.fft_sync_to_display, |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut settings.multirate_fft_analysis_rate_hz,
-                                    15.0..=240.0,
-                                )
-                                .logarithmic(true)
-                                .suffix(" Hz")
-                                .text("Analysis rate"),
-                            );
-                        });
-                        ui.small(if settings.fft_sync_to_display {
-                            "Runs one FFT per presented frame when new audio is available."
-                        } else {
-                            "Uses the fixed FFT analysis rate."
-                        });
+                        fft_cadence_control(ui, settings);
                         ui.add(
                             egui::Slider::new(
                                 &mut settings.multirate_fft_crossovers_hz[0],
@@ -1688,26 +1486,7 @@ fn draw_settings_panel(
                                     .text("Flanagan α"),
                             );
                         }
-                        ui.checkbox(
-                            &mut settings.fft_sync_to_display,
-                            "Sync FFT analysis to display",
-                        );
-                        ui.add_enabled_ui(!settings.fft_sync_to_display, |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut settings.multirate_fft5_analysis_rate_hz,
-                                    15.0..=240.0,
-                                )
-                                .logarithmic(true)
-                                .suffix(" Hz")
-                                .text("Analysis rate"),
-                            );
-                        });
-                        ui.small(if settings.fft_sync_to_display {
-                            "Runs one FFT per presented frame when new audio is available."
-                        } else {
-                            "Uses the fixed FFT analysis rate."
-                        });
+                        fft_cadence_control(ui, settings);
                         let crossover_labels = [
                             "Sub-bass crossover",
                             "Bass crossover",
@@ -1800,187 +1579,6 @@ fn draw_settings_panel(
                         );
                     });
                 }
-                ui.add_enabled_ui(
-                    settings.analysis_method == AnalysisMethod::WindowedDft,
-                    |ui| {
-                egui::ComboBox::from_label("DFT window")
-                    .selected_text(settings.analysis_window.label())
-                    .show_ui(ui, |ui| {
-                        for window in [
-                            AnalysisWindow::Hann,
-                            AnalysisWindow::HalfHann,
-                            AnalysisWindow::HalfBlackman,
-                            AnalysisWindow::AsymmetricKaiser8,
-                            AnalysisWindow::Flanagan,
-                        ] {
-                            ui.selectable_value(
-                                &mut settings.analysis_window,
-                                window,
-                                window.label(),
-                            );
-                        }
-                    });
-                match settings.analysis_window {
-                    AnalysisWindow::AsymmetricKaiser8 => {
-                        ui.add(
-                            egui::Slider::new(&mut settings.asymmetric_kaiser_beta, 0.0..=16.0)
-                                .step_by(0.1)
-                                .text("Kaiser β"),
-                        );
-                        ui.small("Higher β suppresses sidelobes but widens spectral peaks.");
-                    }
-                    AnalysisWindow::Flanagan => {
-                        ui.add(
-                            egui::Slider::new(&mut settings.flanagan_alpha, 2.0..=24.0)
-                                .step_by(0.1)
-                                .text("Flanagan α"),
-                        );
-                        ui.small(format!(
-                            "The response peaks {:.1}% back from the newest sample.",
-                            200.0 / settings.flanagan_alpha,
-                        ));
-                    }
-                    _ => {}
-                }
-                ui.small("Half windows emphasize newer samples for lower perceived delay.");
-                ui.collapsing("DFT sample sizes", |ui| {
-                    ui.small(
-                        "Fewer samples react faster; more samples separate frequencies better.",
-                    );
-                    let half_counts = [64, 128, 256, 512, 1024];
-                    let standard_counts = [128, 256, 512, 1024, 2048];
-                    let double_counts = [256, 512, 1024, 2048, 4096];
-                    let global_label = if settings.adaptive_triple_window {
-                        "0.5× + 1× + 2× Adaptive"
-                    } else if settings.adaptive_dual_window {
-                        "1× + 2× Adaptive"
-                    } else if settings.sample_counts == half_counts {
-                        "0.5×"
-                    } else if settings.sample_counts == standard_counts {
-                        "1×"
-                    } else if settings.sample_counts == double_counts {
-                        "2×"
-                    } else {
-                        "Custom"
-                    };
-                    egui::ComboBox::from_label("All bands")
-                        .selected_text(global_label)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    !settings.adaptive_dual_window
-                                        && !settings.adaptive_triple_window
-                                        && settings.sample_counts == half_counts,
-                                    "0.5×",
-                                )
-                                .clicked()
-                            {
-                                settings.sample_counts = half_counts;
-                                settings.adaptive_dual_window = false;
-                                settings.adaptive_triple_window = false;
-                            }
-                            if ui
-                                .selectable_label(
-                                    !settings.adaptive_dual_window
-                                        && !settings.adaptive_triple_window
-                                        && settings.sample_counts == standard_counts,
-                                    "1×",
-                                )
-                                .clicked()
-                            {
-                                settings.sample_counts = standard_counts;
-                                settings.adaptive_dual_window = false;
-                                settings.adaptive_triple_window = false;
-                            }
-                            if ui
-                                .selectable_label(
-                                    !settings.adaptive_dual_window
-                                        && !settings.adaptive_triple_window
-                                        && settings.sample_counts == double_counts,
-                                    "2×",
-                                )
-                                .clicked()
-                            {
-                                settings.sample_counts = double_counts;
-                                settings.adaptive_dual_window = false;
-                                settings.adaptive_triple_window = false;
-                            }
-                            if ui
-                                .selectable_label(
-                                    settings.adaptive_dual_window,
-                                    "1× + 2× Adaptive",
-                                )
-                                .clicked()
-                            {
-                                settings.sample_counts = standard_counts;
-                                settings.adaptive_dual_window = true;
-                                settings.adaptive_triple_window = false;
-                            }
-                            if ui
-                                .selectable_label(
-                                    settings.adaptive_triple_window,
-                                    "0.5× + 1× + 2× Adaptive",
-                                )
-                                .clicked()
-                            {
-                                settings.sample_counts = standard_counts;
-                                settings.adaptive_dual_window = false;
-                                settings.adaptive_triple_window = true;
-                            }
-                        });
-                    let adaptive = settings.adaptive_dual_window
-                        || settings.adaptive_triple_window;
-                    ui.add_enabled(
-                        adaptive,
-                        egui::Slider::new(&mut settings.adaptive_response_percent, 0.0..=100.0)
-                            .step_by(1.0)
-                            .suffix("%")
-                            .text("Adaptive response"),
-                    );
-                    if settings.adaptive_triple_window {
-                        ui.small("0.5× catches the leading edge, 1× bridges the attack, and 2× supplies steady detail.");
-                    } else if settings.adaptive_dual_window {
-                        ui.small("Fast 1× attacks settle onto the sharper 2× spectrum.");
-                    }
-                    let names = ["Low–80", "80–320", "320–1.28k", "1.28–5.12k", "5.12k–high"];
-                    let choices = [
-                        [64, 128, 256],
-                        [128, 256, 512],
-                        [256, 512, 1024],
-                        [512, 1024, 2048],
-                        [1024, 2048, 4096],
-                    ];
-                    egui::Grid::new("dft sample sizes")
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Band");
-                            ui.strong("Samples");
-                            ui.end_row();
-                            for index in 0..5 {
-                                ui.label(names[index]);
-                                egui::ComboBox::from_id_salt(("dft_samples", index))
-                                    .selected_text(settings.sample_counts[index].to_string())
-                                    .show_ui(ui, |ui| {
-                                        for count in choices[index] {
-                                            if ui
-                                                .selectable_value(
-                                                    &mut settings.sample_counts[index],
-                                                    count,
-                                                    count.to_string(),
-                                                )
-                                                .changed()
-                                            {
-                                                settings.adaptive_dual_window = false;
-                                                settings.adaptive_triple_window = false;
-                                            }
-                                        }
-                                    });
-                                ui.end_row();
-                            }
-                        });
-                });
-                    },
-                );
                     }
                     SettingsTab::Visual => {
                 ui.checkbox(&mut settings.auto_output_sync, "Auto sync to audio output");
@@ -2020,8 +1618,8 @@ fn draw_settings_panel(
                     effective_max / 1000.0,
                     sample_rate / 1000.0,
                 ));
-                ui.add_enabled(
-                    settings.bar_layout == BarLayout::FixedPixels,
+                if settings.bar_layout == BarLayout::FixedPixels {
+                    ui.add(
                     egui::Slider::new(
                         &mut settings.frequency_focus_strength_percent,
                         0.0..=100.0,
@@ -2029,9 +1627,10 @@ fn draw_settings_panel(
                     .step_by(1.0)
                     .suffix("%")
                     .text("Focus strength"),
-                );
-                ui.add_enabled(
-                    settings.bar_layout == BarLayout::FixedPixels,
+                    );
+                }
+                if settings.bar_layout == BarLayout::FixedPixels {
+                    ui.add(
                     egui::Slider::new(
                         &mut settings.frequency_focus_origin_percent,
                         0.0..=100.0,
@@ -2039,7 +1638,8 @@ fn draw_settings_panel(
                     .step_by(1.0)
                     .suffix("%")
                     .text("Focus origin"),
-                );
+                    );
+                }
                 let origin_t = settings.frequency_focus_origin_percent * 0.01;
                 let origin_hz = settings.min_frequency_hz
                     * (effective_max / settings.min_frequency_hz).powf(origin_t);
@@ -2064,48 +1664,6 @@ fn draw_settings_panel(
                         .text("High-frequency floor"),
                 );
                 ui.small("The floor changes smoothly across the logarithmic frequency range.");
-                ui.separator();
-                ui.collapsing("Peak-preserving frequency smoothing", |ui| {
-                    ui.add(
-                        egui::Slider::new(
-                            &mut settings.frequency_smoothing_strength_percent,
-                            0.0..=100.0,
-                        )
-                        .suffix("%")
-                        .text("Strength"),
-                    );
-                    ui.add_enabled_ui(settings.frequency_smoothing_strength_percent > 0.0, |ui| {
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.frequency_smoothing_50_hz_octaves,
-                                1.0 / 192.0..=1.0,
-                            )
-                            .logarithmic(true)
-                            .custom_formatter(|value, _| format!("{:.0} cents", value * 1200.0))
-                            .text("Width at 50 Hz"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.frequency_smoothing_10_khz_octaves,
-                                1.0 / 192.0..=1.0,
-                            )
-                            .logarithmic(true)
-                            .custom_formatter(|value, _| format!("{:.0} cents", value * 1200.0))
-                            .text("Width at 10 kHz"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.frequency_smoothing_max_lift_db,
-                                0.5..=30.0,
-                            )
-                            .suffix(" dB")
-                            .text("Maximum valley lift"),
-                        );
-                    });
-                    ui.small(
-                        "Travels from low and high frequencies, keeps the stronger envelope, and preserves raw peaks.",
-                    );
-                });
                 ui.separator();
                 ui.label("Frequency axis");
                 egui::ComboBox::from_label("Labels")
@@ -2166,6 +1724,7 @@ fn draw_settings_panel(
                             .suffix(" px")
                             .text("3D bar depth"),
                     );
+                    if settings.surface_bar_depth_px.unwrap_or(0.0) > 0.0 {
                     ui.add(
                         egui::Slider::new(&mut settings.surface_volume_stage_count, 3..=8)
                             .text("3D volume stages"),
@@ -2192,6 +1751,7 @@ fn draw_settings_panel(
                         settings.surface_camera_distance,
                         settings.surface_camera_target_y,
                     ));
+                    }
                     ui.add(
                         egui::Slider::new(
                             &mut settings.surface_reflection_strength_percent,
@@ -2215,7 +1775,7 @@ fn draw_settings_panel(
                         &mut settings.surface_history_enabled,
                         "Rendered spectrum history",
                     );
-                    ui.add_enabled_ui(settings.surface_history_enabled, |ui| {
+                    if settings.surface_history_enabled {
                         egui::ComboBox::from_label("Maximum history")
                             .selected_text(format!("{} rows", settings.surface_history_rows))
                             .show_ui(ui, |ui| {
@@ -2267,7 +1827,7 @@ fn draw_settings_panel(
                             .suffix("%")
                             .text("History contrast"),
                         );
-                    });
+                    }
                     ui.small(
                         "Captures the rendered bar baseline into a circular GPU texture once per visual frame. 100% fade leaves 1% brightness at the oldest edge.",
                     );
@@ -2276,7 +1836,7 @@ fn draw_settings_panel(
                         &mut settings.surface_peak_trail_enabled,
                         "Peak moving trail",
                     );
-                    ui.add_enabled_ui(settings.surface_peak_trail_enabled, |ui| {
+                    if settings.surface_peak_trail_enabled {
                         ui.add(
                             egui::Slider::new(
                                 &mut settings.surface_peak_trail_fade_seconds,
@@ -2311,7 +1871,7 @@ fn draw_settings_panel(
                             )
                             .text("Capture every N frames"),
                         );
-                    });
+                    }
                     ui.small(
                         "Transforms the previous peak image toward the viewer, fades it by elapsed time, then overlays the newest peak.",
                     );
@@ -2324,12 +1884,10 @@ fn draw_settings_panel(
                     "Transparent background",
                 );
                 ui.small("Converts rendered light into window transparency.");
-                ui.add_enabled_ui(settings.render_mode == RenderMode::Flat, |ui| {
+                if settings.render_mode == RenderMode::Flat {
                     ui.checkbox(&mut settings.bottom_mirror, "Bottom mirror");
-                });
-                ui.add_enabled_ui(
-                    settings.render_mode == RenderMode::Flat && settings.bottom_mirror,
-                    |ui| {
+                }
+                if settings.render_mode == RenderMode::Flat && settings.bottom_mirror {
                     ui.add(
                         egui::Slider::new(&mut settings.mirror_baseline_percent, 0.0..=100.0)
                             .step_by(1.0)
@@ -2351,8 +1909,7 @@ fn draw_settings_panel(
                             .suffix("%")
                             .text("Reflection fade strength"),
                     );
-                    },
-                );
+                    }
                 if settings.render_mode == RenderMode::Flat {
                     ui.small(
                         "The reflection matches the original height and fades exponentially from its initial brightness.",
@@ -2365,12 +1922,13 @@ fn draw_settings_panel(
                             ui.selectable_value(&mut settings.bar_layout, mode, mode.label());
                         }
                     });
-                ui.add_enabled(
-                    settings.bar_layout == BarLayout::FixedPixels,
+                if settings.bar_layout == BarLayout::FixedPixels {
+                    ui.add(
                     egui::Slider::new(&mut settings.bar_width_px, 1.0..=16.0)
                         .suffix(" px")
                         .text("Fixed bar width"),
-                );
+                    );
+                }
                 ui.add(
                     egui::Slider::new(&mut settings.bar_spacing_px, 0.0..=12.0)
                         .step_by(0.1)
@@ -2400,7 +1958,7 @@ fn draw_settings_panel(
                 );
                 ui.small("Bar light maps from the local dB floor to 0 dB.");
                 ui.checkbox(&mut settings.rise_highlight, "Highlight fast rises");
-                ui.add_enabled_ui(settings.rise_highlight, |ui| {
+                if settings.rise_highlight {
                     ui.add(
                         egui::Slider::new(&mut settings.rise_highlight_strength, 0.0..=3.0)
                             .text("Peak glow strength"),
@@ -2417,7 +1975,7 @@ fn draw_settings_panel(
                             .suffix(" dB")
                             .text("Full glow rise"),
                     );
-                });
+                }
                 ui.small(
                     "Peak and bar glow follow the same dB rise. Bar glow fades about 3× faster to preserve detail.",
                 );
@@ -2444,33 +2002,6 @@ fn draw_settings_panel(
                     "Peak keeps a little upward velocity, pauses at its apex, then falls under gravity.",
                 );
                 ui.separator();
-                ui.checkbox(&mut settings.temporal_smoothing, "Temporal smoothing");
-                ui.add_enabled_ui(settings.temporal_smoothing, |ui| {
-                    ui.label("Lower values react or decay faster.");
-                    egui::Grid::new("band smoothing")
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Band");
-                            ui.strong("Attack");
-                            ui.strong("Decay");
-                            ui.end_row();
-                            let names = ["Low–80", "80–320", "320–1.28k", "1.28–5.12k", "5.12k–high"];
-                            for (index, name) in names.into_iter().enumerate() {
-                                ui.label(name);
-                                ui.add(
-                                    egui::DragValue::new(&mut settings.attacks[index])
-                                        .range(0.0..=0.99)
-                                        .speed(0.01),
-                                );
-                                ui.add(
-                                    egui::DragValue::new(&mut settings.decays[index])
-                                        .range(0.0..=0.99)
-                                        .speed(0.01),
-                                );
-                                ui.end_row();
-                            }
-                        });
-                });
                     }
                 }
                 ui.separator();
@@ -2487,6 +2018,10 @@ fn draw_settings_panel(
 pub struct GpuState {
     surface: wgpu::Surface<'static>,
     controls_surface: wgpu::Surface<'static>,
+    compute_pipeline_layout: wgpu::PipelineLayout,
+    render_pipeline_layout: wgpu::PipelineLayout,
+    composite_pipeline_layout: wgpu::PipelineLayout,
+    peak_feedback_pipeline_layout: wgpu::PipelineLayout,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -2495,30 +2030,24 @@ pub struct GpuState {
     controls_size: PhysicalSize<u32>,
     pending_size: Option<PhysicalSize<u32>>,
     last_surface_configure: Instant,
-    decimate_upper_mid_pipeline: wgpu::ComputePipeline,
-    decimate_mid_pipeline: wgpu::ComputePipeline,
-    decimate_bass_pipeline: wgpu::ComputePipeline,
-    decimate_sub_bass_pipeline: wgpu::ComputePipeline,
-    compute_pipeline: wgpu::ComputePipeline,
-    resonator_pipeline: wgpu::ComputePipeline,
-    gammatone_pipeline: wgpu::ComputePipeline,
-    multirate_fft_pipeline: wgpu::ComputePipeline,
-    hybrid_fft_pipeline: wgpu::ComputePipeline,
-    frequency_smoothing_pipeline: wgpu::ComputePipeline,
+    resonator_pipeline: Option<wgpu::ComputePipeline>,
+    gammatone_pipeline: Option<wgpu::ComputePipeline>,
+    multirate_fft_pipeline: Option<wgpu::ComputePipeline>,
+    hybrid_fft_pipeline: Option<wgpu::ComputePipeline>,
     compose_display_pipeline: wgpu::ComputePipeline,
     grid_pipeline: wgpu::RenderPipeline,
-    axis_overlay_pipeline: wgpu::RenderPipeline,
+    axis_overlay_pipeline: Option<wgpu::RenderPipeline>,
     glow_pipeline: wgpu::RenderPipeline,
     render_pipeline: wgpu::RenderPipeline,
-    prism_pipeline: wgpu::RenderPipeline,
+    prism_pipeline: Option<wgpu::RenderPipeline>,
     peak_glow_pipeline: wgpu::RenderPipeline,
     peak_pipeline: wgpu::RenderPipeline,
-    peak_volume_pipeline: wgpu::RenderPipeline,
-    peak_feedback_pipeline: wgpu::RenderPipeline,
+    peak_volume_pipeline: Option<wgpu::RenderPipeline>,
+    peak_feedback_pipeline: Option<wgpu::RenderPipeline>,
     peak_feedback_bind_group_layout: wgpu::BindGroupLayout,
     peak_feedback_bind_groups: [wgpu::BindGroup; 2],
     peak_trail_sampler: wgpu::Sampler,
-    composite_pipeline: wgpu::RenderPipeline,
+    composite_pipeline: Option<wgpu::RenderPipeline>,
     composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_bind_groups: [wgpu::BindGroup; 2],
     composite_params_buffer: wgpu::Buffer,
@@ -2536,7 +2065,11 @@ pub struct GpuState {
     peak_trail_previous_index: usize,
     peak_trail_was_enabled: bool,
     peak_trail_capture_frame: u32,
-    analyzers: [AnalyzerChannel; 2],
+    analyzers: Vec<AnalyzerChannel>,
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    render_bind_group_layout: wgpu::BindGroupLayout,
+    resource_mode: (AnalysisMethod, bool, bool, usize),
+    target_features: (bool, bool, bool),
     left_history: Vec<f32>,
     right_history: Vec<f32>,
     sample_rate: f32,
@@ -2546,21 +2079,15 @@ pub struct GpuState {
     last_bin_count: u32,
     last_db_floors: [f32; 2],
     last_frequency_mapping: [f32; 4],
-    last_sample_counts: [u32; 5],
-    last_adaptive_dual_window: bool,
-    last_adaptive_triple_window: bool,
     last_analysis_method: AnalysisMethod,
     last_channel_mode: ChannelMode,
     last_delay_samples: usize,
     last_resonator_q: [f32; 2],
-    last_resonator_stage_count: u32,
-    last_resonator_two_stage_q_percent: f32,
     last_resonator_measurement: ResonatorMeasurement,
     last_resonator_envelope: ResonatorEnvelope,
     last_resonator_multirate: bool,
     last_resonator_five_stage: bool,
     last_resonator_timestamp_alignment: bool,
-    last_hybrid_fft_gains: [f32; 2],
     last_hybrid_adaptive_matching: bool,
     last_auditory_filter_order: u32,
     last_auditory_display_settings: [f32; 6],
@@ -2588,6 +2115,7 @@ struct AnalyzerChannel {
     render_channel_buffer: wgpu::Buffer,
     multirate_fft: MultirateFft,
     hybrid_band_matcher: HybridBandMatcher,
+    fft_match_elapsed: f32,
     resonator_resampler: ResonatorResampler,
     audio_history: Vec<f32>,
     samples: Vec<f32>,
@@ -2680,46 +2208,7 @@ impl GpuState {
         };
         controls_surface.configure(&device, &controls_config);
 
-        let samples = vec![0.0; SAMPLE_COUNT];
         let history_sample_count = HISTORY_SAMPLE_COUNT.max(SAMPLE_COUNT + sample_rate as usize);
-        let sample_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("audio samples"),
-            size: (SAMPLE_COUNT.max(MAX_MULTIRATE_MAGNITUDE_COUNT) * std::mem::size_of::<f32>())
-                as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let fft_magnitude_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("FFT magnitudes"),
-            size: (MAX_MULTIRATE_MAGNITUDE_COUNT * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spectrum bins"),
-            // analyzed level, bar velocity, previous fast-window level, spare
-            size: MAX_BIN_COUNT as u64 * std::mem::size_of::<[f32; 4]>() as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let display_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("display spectrum bins"),
-            // displayed level, peak fall velocity, peak level, peak hold time
-            size: MAX_BIN_COUNT as u64 * std::mem::size_of::<[f32; 4]>() as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let mid_buffer = storage_buffer(&device, "decimated /4 or mid samples", 4096);
-        let bass_buffer = storage_buffer(&device, "decimated /8 or bass samples", 2048);
-        let upper_mid_buffer = storage_buffer(&device, "decimated /2 or upper-mid samples", 8192);
-        let sub_bass_buffer = storage_buffer(&device, "decimated sub-bass or /16 samples", 1024);
-        // Three vec4s per bin hold the four-stage gammatone and oscillator
-        // state. A fourth vec4 per bin is shared frequency-smoothing scratch.
-        let resonator_state_buffer = storage_buffer(
-            &device,
-            "analysis auxiliary state",
-            MAX_BIN_COUNT as u64 * 16,
-        );
         let settings_path =
             settings_path(profile).context("could not find the macOS home directory")?;
         let settings = VisualizerSettings::load(&settings_path);
@@ -2733,214 +2222,21 @@ impl GpuState {
             [0.0; 4],
             size,
         );
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("analysis parameters"),
-            contents: bytemuck::bytes_of(&initial_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let initial_channel_count = settings.channel_mode.channel_count() as f32;
-        let render_channel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("render channel parameters"),
-            contents: bytemuck::bytes_of(&RenderChannelParams {
-                channel_index: 0.0,
-                channel_count: initial_channel_count,
-                bottom_mirror: if settings.render_mode == RenderMode::Flat && settings.bottom_mirror
-                {
-                    1.0
-                } else {
-                    0.0
-                },
-                stereo_treble_center: if settings.stereo_treble_center {
-                    1.0
-                } else {
-                    0.0
-                },
-                mirror_baseline_percent: settings.mirror_baseline_percent,
-                mirror_initial_fade_percent: settings.mirror_initial_fade_percent,
-                mirror_fade_percent: settings.mirror_fade_percent,
-                axis_labels_overlay: if settings.axis_labels_overlay {
-                    1.0
-                } else {
-                    0.0
-                },
-                axis_label_mode: settings.axis_label_mode.shader_value(),
-                show_frequency_grid: if settings.show_frequency_grid {
-                    1.0
-                } else {
-                    0.0
-                },
-                bar_depth_pixels: if settings.render_mode == RenderMode::Surface3d {
-                    settings.surface_bar_depth_px.unwrap_or(0.0)
-                } else {
-                    0.0
-                },
-                peak_depth_brightness_percent: settings.surface_peak_depth_brightness_percent,
-                volume_stage_count: settings.surface_volume_stage_count as f32,
-                _padding_0: 0.0,
-                _padding_1: 0.0,
-                _padding_2: 0.0,
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("audio compute layout"),
-                entries: &[
-                    storage_entry(0, true, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(1, false, wgpu::ShaderStages::COMPUTE),
-                    uniform_entry(2, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(3, false, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(4, false, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(5, false, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(6, false, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(7, false, wgpu::ShaderStages::COMPUTE),
-                    storage_entry(8, false, wgpu::ShaderStages::COMPUTE),
-                ],
-            });
-        let render_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("audio render layout"),
-                entries: &[
-                    storage_entry(7, true, wgpu::ShaderStages::VERTEX),
-                    storage_entry(8, true, wgpu::ShaderStages::VERTEX),
-                    uniform_entry(2, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
-                    uniform_entry(9, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
-                ],
-            });
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("audio compute bindings"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: sample_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: spectrum_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: mid_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bass_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: upper_mid_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: sub_bass_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: display_spectrum_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: resonator_state_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let fft_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("FFT compute bindings"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fft_magnitude_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: spectrum_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: mid_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bass_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: upper_mid_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: sub_bass_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: display_spectrum_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: resonator_state_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("audio render bindings"),
-            layout: &render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: display_spectrum_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: resonator_state_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: render_channel_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let first_analyzer = AnalyzerChannel {
-            compute_bind_group,
-            fft_compute_bind_group,
-            render_bind_group,
-            sample_buffer,
-            fft_magnitude_buffer,
-            resonator_half_buffer: upper_mid_buffer,
-            resonator_quarter_buffer: mid_buffer,
-            resonator_eighth_buffer: bass_buffer,
-            resonator_sixteenth_buffer: sub_bass_buffer,
-            params_buffer,
-            render_channel_buffer,
-            multirate_fft: MultirateFft::default(),
-            hybrid_band_matcher: HybridBandMatcher::default(),
-            resonator_resampler: ResonatorResampler::default(),
-            audio_history: vec![0.0; history_sample_count],
-            samples,
-        };
-        let second_analyzer = create_analyzer_channel(
-            &device,
-            &compute_bind_group_layout,
-            &render_bind_group_layout,
-            &initial_params,
-            history_sample_count,
-            1,
-            initial_channel_count,
-        );
+        let (compute_bind_group_layout, render_bind_group_layout) = analyzer_layouts(&device);
+        let analyzers = (0..settings.channel_mode.channel_count())
+            .map(|index| {
+                create_analyzer_channel(
+                    &device,
+                    &compute_bind_group_layout,
+                    &render_bind_group_layout,
+                    &initial_params,
+                    history_sample_count,
+                    index,
+                    settings.channel_mode.channel_count() as f32,
+                    &settings,
+                )
+            })
+            .collect();
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("analysis pipeline layout"),
@@ -2955,34 +2251,7 @@ impl GpuState {
             });
 
         let compute_shader = device.create_shader_module(wgpu::include_wgsl!("analysis.wgsl"));
-        let decimate_upper_mid_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &compute_shader,
-            "upper-mid decimator",
-            "decimate_upper_mid",
-        );
-        let decimate_mid_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &compute_shader,
-            "mid-band decimator",
-            "decimate_mid",
-        );
-        let decimate_bass_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &compute_shader,
-            "bass-band decimator",
-            "decimate_bass",
-        );
-        let decimate_sub_bass_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &compute_shader,
-            "sub-bass decimator",
-            "decimate_sub_bass",
-        );
+
         let compose_display_pipeline = compute_pipeline(
             &device,
             &compute_pipeline_layout,
@@ -2990,53 +2259,7 @@ impl GpuState {
             "spectrum display composition",
             "compose_display",
         );
-        let frequency_smoothing_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &compute_shader,
-            "peak-preserving frequency smoothing",
-            "smooth_frequency",
-        );
-        let resonator_shader = device.create_shader_module(wgpu::include_wgsl!("resonator.wgsl"));
-        let resonator_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &resonator_shader,
-            "frequency-dependent resonator bank",
-            "resonate",
-        );
-        let gammatone_shader = device.create_shader_module(wgpu::include_wgsl!("gammatone.wgsl"));
-        let gammatone_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &gammatone_shader,
-            "auditory ERB gammatone bank",
-            "analyze_erb",
-        );
-        let multirate_fft_shader =
-            device.create_shader_module(wgpu::include_wgsl!("multirate_fft.wgsl"));
-        let multirate_fft_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &multirate_fft_shader,
-            "multirate FFT logarithmic mapper",
-            "map_fft",
-        );
-        let hybrid_fft_pipeline = compute_pipeline(
-            &device,
-            &compute_pipeline_layout,
-            &multirate_fft_shader,
-            "hybrid high-frequency FFT mapper",
-            "map_hybrid",
-        );
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("spectrum analysis"),
-            layout: Some(&compute_pipeline_layout),
-            module: &compute_shader,
-            entry_point: Some("analyze"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+
         let render_shader = device.create_shader_module(wgpu::include_wgsl!("visualizer.wgsl"));
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("logarithmic frequency axis"),
@@ -3063,32 +2286,7 @@ impl GpuState {
             multiview: None,
             cache: None,
         });
-        let axis_overlay_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("frequency axis label overlay"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &render_shader,
-                    entry_point: Some("grid_vs"),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &render_shader,
-                    entry_point: Some("axis_overlay_fs"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("spectrum renderer"),
             layout: Some(&render_pipeline_layout),
@@ -3114,31 +2312,7 @@ impl GpuState {
             multiview: None,
             cache: None,
         });
-        let prism_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dyadic layered spectrum volume"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("prism_vs"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("prism_fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+
         let glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("spectrum additive glow"),
             layout: Some(&render_pipeline_layout),
@@ -3196,31 +2370,7 @@ impl GpuState {
             multiview: None,
             cache: None,
         });
-        let peak_volume_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dyadic layered peak indicators"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("peak_volume_vs"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("peak_fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+
         let peak_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("peak indicator onset glow"),
             layout: Some(&render_pipeline_layout),
@@ -3302,32 +2452,7 @@ impl GpuState {
                 bind_group_layouts: &[&composite_bind_group_layout],
                 push_constant_ranges: &[],
             });
-        let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
-        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("luminance-to-alpha compositor"),
-            layout: Some(&composite_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &composite_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &composite_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+
         let peak_feedback_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("peak feedback bind group layout"),
@@ -3367,34 +2492,7 @@ impl GpuState {
                 bind_group_layouts: &[&peak_feedback_bind_group_layout],
                 push_constant_ranges: &[],
             });
-        let peak_feedback_shader =
-            device.create_shader_module(wgpu::include_wgsl!("peak_feedback.wgsl"));
-        let peak_feedback_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("moving peak temporal feedback"),
-                layout: Some(&peak_feedback_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &peak_feedback_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &peak_feedback_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+
         let composite_params_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("visual compositor parameters"),
@@ -3467,7 +2565,7 @@ impl GpuState {
             &composite_params_buffer,
             &peak_trail_sampler,
             format,
-            size,
+            target_size(size, visual_target_features(&settings).2),
         );
         let (
             visual_texture,
@@ -3480,8 +2578,9 @@ impl GpuState {
             &composite_bind_group_layout,
             &composite_params_buffer,
             format,
-            size,
+            target_size(size, visual_target_features(&settings).0),
             initial_surface_history_rows,
+            visual_target_features(&settings).1,
             &peak_trail_views,
         );
         let ui = UiLayer::new(&device, format, controls_window.as_ref());
@@ -3489,6 +2588,10 @@ impl GpuState {
         Ok(Self {
             surface,
             controls_surface,
+            compute_pipeline_layout,
+            render_pipeline_layout,
+            composite_pipeline_layout,
+            peak_feedback_pipeline_layout,
             device,
             queue,
             config,
@@ -3497,30 +2600,24 @@ impl GpuState {
             controls_size,
             pending_size: None,
             last_surface_configure: Instant::now(),
-            decimate_upper_mid_pipeline,
-            decimate_mid_pipeline,
-            decimate_bass_pipeline,
-            decimate_sub_bass_pipeline,
-            compute_pipeline,
-            resonator_pipeline,
-            gammatone_pipeline,
-            multirate_fft_pipeline,
-            hybrid_fft_pipeline,
-            frequency_smoothing_pipeline,
+            resonator_pipeline: None,
+            gammatone_pipeline: None,
+            multirate_fft_pipeline: None,
+            hybrid_fft_pipeline: None,
             compose_display_pipeline,
             grid_pipeline,
-            axis_overlay_pipeline,
+            axis_overlay_pipeline: None,
             glow_pipeline,
             render_pipeline,
-            prism_pipeline,
+            prism_pipeline: None,
             peak_glow_pipeline,
             peak_pipeline,
-            peak_volume_pipeline,
-            peak_feedback_pipeline,
+            peak_volume_pipeline: None,
+            peak_feedback_pipeline: None,
             peak_feedback_bind_group_layout,
             peak_feedback_bind_groups,
             peak_trail_sampler,
-            composite_pipeline,
+            composite_pipeline: None,
             composite_bind_group_layout,
             composite_bind_groups,
             composite_params_buffer,
@@ -3538,7 +2635,16 @@ impl GpuState {
             peak_trail_previous_index: 0,
             peak_trail_was_enabled: false,
             peak_trail_capture_frame: 0,
-            analyzers: [first_analyzer, second_analyzer],
+            analyzers,
+            compute_bind_group_layout,
+            render_bind_group_layout,
+            resource_mode: (
+                settings.analysis_method,
+                settings.resonator_multirate,
+                settings.resonator_five_stage,
+                fft_magnitude_count(&settings),
+            ),
+            target_features: visual_target_features(&settings),
             left_history: vec![0.0; history_sample_count],
             right_history: vec![0.0; history_sample_count],
             sample_rate: sample_rate as f32,
@@ -3553,24 +2659,15 @@ impl GpuState {
                 settings.frequency_focus_strength_percent,
                 settings.frequency_focus_origin_percent,
             ],
-            last_sample_counts: settings.sample_counts,
-            last_adaptive_dual_window: settings.adaptive_dual_window,
-            last_adaptive_triple_window: settings.adaptive_triple_window,
             last_analysis_method: settings.analysis_method,
             last_channel_mode: settings.channel_mode,
             last_delay_samples: 0,
             last_resonator_q: [settings.resonator_q_50_hz, settings.resonator_q_10_khz],
-            last_resonator_stage_count: settings.resonator_stage_count,
-            last_resonator_two_stage_q_percent: settings.resonator_two_stage_q_percent,
             last_resonator_measurement: settings.resonator_measurement,
             last_resonator_envelope: settings.resonator_envelope,
             last_resonator_multirate: settings.resonator_multirate,
             last_resonator_five_stage: settings.resonator_five_stage,
             last_resonator_timestamp_alignment: settings.resonator_timestamp_alignment,
-            last_hybrid_fft_gains: [
-                settings.hybrid_half_fft_gain_db,
-                settings.hybrid_full_fft_gain_db,
-            ],
             last_hybrid_adaptive_matching: settings.hybrid_adaptive_matching,
             last_auditory_filter_order: settings.auditory_filter_order,
             last_auditory_display_settings: [
@@ -3626,6 +2723,149 @@ impl GpuState {
         }
     }
 
+    fn prepare_resources(&mut self) {
+        let resource_mode = (
+            self.settings.analysis_method,
+            self.settings.resonator_multirate,
+            self.settings.resonator_five_stage,
+            fft_magnitude_count(&self.settings),
+        );
+        let count = self.settings.channel_mode.channel_count();
+        if self.resource_mode != resource_mode {
+            self.analyzers.clear();
+            self.resource_mode = resource_mode;
+            self.resonator_needs_reset = true;
+        }
+        self.analyzers.truncate(count);
+        while self.analyzers.len() < count {
+            let params = analysis_params(
+                &self.settings,
+                [self.sample_rate, 0.0, 0.0],
+                display_bin_count(&self.settings, self.size, self.sample_rate),
+                true,
+                ([0; 5], true),
+                [0.0; 4],
+                self.size,
+            );
+            self.analyzers.push(create_analyzer_channel(
+                &self.device,
+                &self.compute_bind_group_layout,
+                &self.render_bind_group_layout,
+                &params,
+                self.left_history.len(),
+                self.analyzers.len(),
+                count as f32,
+                &self.settings,
+            ));
+            self.resonator_needs_reset = true;
+        }
+        if matches!(
+            self.settings.analysis_method,
+            AnalysisMethod::ResonatorBank | AnalysisMethod::HybridResonatorFft
+        ) {
+            if self.resonator_pipeline.is_none() {
+                self.resonator_pipeline = Some(build_resonator_pipeline(
+                    &self.device,
+                    &self.compute_pipeline_layout,
+                ));
+            }
+        } else {
+            self.resonator_pipeline = None;
+        }
+        if self.settings.analysis_method == AnalysisMethod::AuditoryErb {
+            if self.gammatone_pipeline.is_none() {
+                self.gammatone_pipeline = Some(build_gammatone_pipeline(
+                    &self.device,
+                    &self.compute_pipeline_layout,
+                ));
+            }
+        } else {
+            self.gammatone_pipeline = None;
+        }
+        if matches!(
+            self.settings.analysis_method,
+            AnalysisMethod::MultirateFft | AnalysisMethod::MultirateFft5
+        ) {
+            if self.multirate_fft_pipeline.is_none() {
+                self.multirate_fft_pipeline = Some(build_multirate_fft_pipeline(
+                    &self.device,
+                    &self.compute_pipeline_layout,
+                ));
+            }
+        } else {
+            self.multirate_fft_pipeline = None;
+        }
+        if self.settings.analysis_method == AnalysisMethod::HybridResonatorFft {
+            if self.hybrid_fft_pipeline.is_none() {
+                self.hybrid_fft_pipeline = Some(build_hybrid_fft_pipeline(
+                    &self.device,
+                    &self.compute_pipeline_layout,
+                ));
+            }
+        } else {
+            self.hybrid_fft_pipeline = None;
+        }
+        if self.settings.axis_labels_overlay {
+            if self.axis_overlay_pipeline.is_none() {
+                self.axis_overlay_pipeline = Some(build_axis_overlay_pipeline(
+                    &self.device,
+                    &self.render_pipeline_layout,
+                    self.config.format,
+                ));
+            }
+        } else {
+            self.axis_overlay_pipeline = None;
+        }
+        if self.settings.render_mode == RenderMode::Surface3d
+            && self.settings.surface_bar_depth_px.unwrap_or(0.0) > 0.0
+        {
+            if self.prism_pipeline.is_none() {
+                self.prism_pipeline = Some(build_prism_pipeline(
+                    &self.device,
+                    &self.render_pipeline_layout,
+                    self.config.format,
+                ));
+            }
+        } else {
+            self.prism_pipeline = None;
+        }
+        if self.settings.render_mode == RenderMode::Surface3d
+            && self.settings.surface_bar_depth_px.unwrap_or(0.0) > 0.0
+        {
+            if self.peak_volume_pipeline.is_none() {
+                self.peak_volume_pipeline = Some(build_peak_volume_pipeline(
+                    &self.device,
+                    &self.render_pipeline_layout,
+                    self.config.format,
+                ));
+            }
+        } else {
+            self.peak_volume_pipeline = None;
+        }
+        if visual_target_features(&self.settings).0 {
+            if self.composite_pipeline.is_none() {
+                self.composite_pipeline = Some(build_composite_pipeline(
+                    &self.device,
+                    &self.composite_pipeline_layout,
+                    self.config.format,
+                ));
+            }
+        } else {
+            self.composite_pipeline = None;
+        }
+        if visual_target_features(&self.settings).2 {
+            if self.peak_feedback_pipeline.is_none() {
+                self.peak_feedback_pipeline = Some(build_peak_feedback_pipeline(
+                    &self.device,
+                    &self.peak_feedback_pipeline_layout,
+                    self.config.format,
+                ));
+            }
+        } else {
+            self.peak_feedback_pipeline = None;
+        }
+    }
+
     fn recreate_visual_targets(&mut self) {
         let desired_history_rows = self
             .settings
@@ -3643,7 +2883,7 @@ impl GpuState {
             &self.composite_params_buffer,
             &self.peak_trail_sampler,
             self.config.format,
-            self.size,
+            target_size(self.size, visual_target_features(&self.settings).2),
         );
         let (
             visual_texture,
@@ -3656,10 +2896,12 @@ impl GpuState {
             &self.composite_bind_group_layout,
             &self.composite_params_buffer,
             self.config.format,
-            self.size,
+            target_size(self.size, visual_target_features(&self.settings).0),
             desired_history_rows,
+            visual_target_features(&self.settings).1,
             &peak_trail_views,
         );
+        self.target_features = visual_target_features(&self.settings);
         self.visual_texture = visual_texture;
         self.visual_view = visual_view;
         self.surface_history_texture = surface_history_texture;
@@ -3683,7 +2925,10 @@ impl GpuState {
             .settings
             .surface_history_rows
             .clamp(MIN_SURFACE_HISTORY_ROWS, MAX_SURFACE_HISTORY_ROWS);
-        if desired_history_rows != self.surface_history_rows {
+        if self.target_features != visual_target_features(&self.settings)
+            || (visual_target_features(&self.settings).1
+                && desired_history_rows != self.surface_history_rows)
+        {
             self.recreate_visual_targets();
         }
     }
@@ -3736,6 +2981,7 @@ impl GpuState {
         self.save_settings_if_due();
         self.apply_pending_resize();
         self.apply_surface_history_size();
+        self.prepare_resources();
         let now = Instant::now();
         let frame_delta = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -3764,9 +3010,9 @@ impl GpuState {
                 ChannelMode::Left => unreachable!(),
             }
         }
-        let requested_delay = (visual_delay_ms(&self.settings, self.output_latency_ms)
-            * self.sample_rate / 1000.0)
-            .round() as usize;
+        let requested_delay =
+            (visual_delay_ms(&self.settings, self.output_latency_ms) * self.sample_rate / 1000.0)
+                .round() as usize;
         let history_sample_count = self.left_history.len();
         let resonator_alignment_delay = if matches!(
             self.settings.analysis_method,
@@ -3825,10 +3071,6 @@ impl GpuState {
             self.settings.resonator_q_10_khz,
         ];
         let resonator_q_changed = resonator_q != self.last_resonator_q;
-        let resonator_stage_count_changed =
-            self.settings.resonator_stage_count != self.last_resonator_stage_count;
-        let resonator_two_stage_q_changed =
-            self.settings.resonator_two_stage_q_percent != self.last_resonator_two_stage_q_percent;
         let resonator_measurement_changed =
             self.settings.resonator_measurement != self.last_resonator_measurement;
         let resonator_envelope_changed =
@@ -3839,11 +3081,6 @@ impl GpuState {
             self.settings.resonator_five_stage != self.last_resonator_five_stage;
         let resonator_timestamp_alignment_changed =
             self.settings.resonator_timestamp_alignment != self.last_resonator_timestamp_alignment;
-        let hybrid_fft_gains = [
-            self.settings.hybrid_half_fft_gain_db,
-            self.settings.hybrid_full_fft_gain_db,
-        ];
-        let hybrid_fft_gains_changed = hybrid_fft_gains != self.last_hybrid_fft_gains;
         let hybrid_adaptive_matching_changed =
             self.settings.hybrid_adaptive_matching != self.last_hybrid_adaptive_matching;
         let auditory_filter_order_changed =
@@ -3865,24 +3102,17 @@ impl GpuState {
         let current_multirate_crossovers = multirate_crossovers(&self.settings);
         let multirate_crossovers_changed =
             current_multirate_crossovers != self.last_multirate_crossovers;
-        let dft_settings_changed = self.settings.sample_counts != self.last_sample_counts
-            || self.settings.adaptive_dual_window != self.last_adaptive_dual_window
-            || self.settings.adaptive_triple_window != self.last_adaptive_triple_window;
         let reset_envelopes = mapping_changed
             || db_floors != self.last_db_floors
-            || dft_settings_changed
             || method_changed
             || channel_mode_changed
             || delay_changed
             || resonator_q_changed
-            || resonator_stage_count_changed
-            || resonator_two_stage_q_changed
             || resonator_measurement_changed
             || resonator_envelope_changed
             || resonator_multirate_changed
             || resonator_five_stage_changed
             || resonator_timestamp_alignment_changed
-            || hybrid_fft_gains_changed
             || hybrid_adaptive_matching_changed
             || auditory_filter_order_changed
             || auditory_display_changed
@@ -3895,8 +3125,6 @@ impl GpuState {
             || channel_mode_changed
             || delay_changed
             || resonator_q_changed
-            || resonator_stage_count_changed
-            || resonator_two_stage_q_changed
             || resonator_measurement_changed
             || resonator_envelope_changed
             || resonator_multirate_changed
@@ -3915,21 +3143,15 @@ impl GpuState {
         self.last_bin_count = bin_count;
         self.last_db_floors = db_floors;
         self.last_frequency_mapping = frequency_mapping;
-        self.last_sample_counts = self.settings.sample_counts;
-        self.last_adaptive_dual_window = self.settings.adaptive_dual_window;
-        self.last_adaptive_triple_window = self.settings.adaptive_triple_window;
         self.last_analysis_method = self.settings.analysis_method;
         self.last_channel_mode = self.settings.channel_mode;
         self.last_delay_samples = delay_samples;
         self.last_resonator_q = resonator_q;
-        self.last_resonator_stage_count = self.settings.resonator_stage_count;
-        self.last_resonator_two_stage_q_percent = self.settings.resonator_two_stage_q_percent;
         self.last_resonator_measurement = self.settings.resonator_measurement;
         self.last_resonator_envelope = self.settings.resonator_envelope;
         self.last_resonator_multirate = self.settings.resonator_multirate;
         self.last_resonator_five_stage = self.settings.resonator_five_stage;
         self.last_resonator_timestamp_alignment = self.settings.resonator_timestamp_alignment;
-        self.last_hybrid_fft_gains = hybrid_fft_gains;
         self.last_hybrid_adaptive_matching = self.settings.hybrid_adaptive_matching;
         self.last_auditory_filter_order = self.settings.auditory_filter_order;
         self.last_auditory_display_settings = auditory_display_settings;
@@ -3969,6 +3191,7 @@ impl GpuState {
                 analyzer.hybrid_band_matcher.clear();
             }
 
+            analyzer.fft_match_elapsed += frame_delta;
             if self.settings.analysis_method.is_multirate_fft() {
                 let fft_end = if self.settings.analysis_method == AnalysisMethod::HybridResonatorFft
                 {
@@ -3981,19 +3204,15 @@ impl GpuState {
                         .multirate_fft
                         .reset(fft_config, &analyzer.audio_history[..fft_end]);
                 } else {
-                    analyzer
-                        .multirate_fft
-                        .set_analysis_rate(fft_config.analysis_rate_hz);
                     let new_count = drained_sample_count.min(fft_end);
                     analyzer
                         .multirate_fft
                         .ingest(&analyzer.audio_history[fft_end - new_count..fft_end]);
                 }
-                if let Some(magnitudes) = analyzer.multirate_fft.analyze_if_due(
-                    self.sample_rate,
-                    multirate_fft_needs_reset,
-                    self.settings.fft_sync_to_display,
-                ) {
+                if let Some(magnitudes) = analyzer
+                    .multirate_fft
+                    .analyze_if_due(multirate_fft_needs_reset, self.settings.fft_display_divisor)
+                {
                     if self.settings.analysis_method == AnalysisMethod::HybridResonatorFft
                         && self.settings.hybrid_adaptive_matching
                     {
@@ -4001,9 +3220,10 @@ impl GpuState {
                             magnitudes,
                             fft_config,
                             self.sample_rate,
-                            frame_delta,
+                            analyzer.fft_match_elapsed,
                         );
                     }
+                    analyzer.fft_match_elapsed = 0.0;
                     self.queue.write_buffer(
                         &analyzer.fft_magnitude_buffer,
                         0,
@@ -4231,12 +3451,6 @@ impl GpuState {
                 label: Some("visual-audio frame"),
             });
         {
-            let sample_multiplier =
-                if self.settings.adaptive_dual_window || self.settings.adaptive_triple_window {
-                    2
-                } else {
-                    1
-                };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("GPU spectrum analysis"),
                 timestamp_writes: None,
@@ -4245,60 +3459,39 @@ impl GpuState {
                 match self.settings.analysis_method {
                     AnalysisMethod::ResonatorBank => {
                         pass.set_bind_group(0, &analyzer.compute_bind_group, &[]);
-                        pass.set_pipeline(&self.resonator_pipeline);
+                        pass.set_pipeline(
+                            self.resonator_pipeline.as_ref().expect("active pipeline"),
+                        );
                         pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
                     }
                     AnalysisMethod::HybridResonatorFft => {
                         pass.set_bind_group(0, &analyzer.compute_bind_group, &[]);
-                        pass.set_pipeline(&self.resonator_pipeline);
+                        pass.set_pipeline(
+                            self.resonator_pipeline.as_ref().expect("active pipeline"),
+                        );
                         pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
                         pass.set_bind_group(0, &analyzer.fft_compute_bind_group, &[]);
-                        pass.set_pipeline(&self.hybrid_fft_pipeline);
+                        pass.set_pipeline(
+                            self.hybrid_fft_pipeline.as_ref().expect("active pipeline"),
+                        );
                         pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
                     }
                     AnalysisMethod::AuditoryErb => {
                         pass.set_bind_group(0, &analyzer.compute_bind_group, &[]);
-                        pass.set_pipeline(&self.gammatone_pipeline);
+                        pass.set_pipeline(
+                            self.gammatone_pipeline.as_ref().expect("active pipeline"),
+                        );
                         pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
                     }
                     AnalysisMethod::MultirateFft | AnalysisMethod::MultirateFft5 => {
                         pass.set_bind_group(0, &analyzer.fft_compute_bind_group, &[]);
-                        pass.set_pipeline(&self.multirate_fft_pipeline);
+                        pass.set_pipeline(
+                            self.multirate_fft_pipeline
+                                .as_ref()
+                                .expect("active pipeline"),
+                        );
                         pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
                     }
-                    AnalysisMethod::WindowedDft => {
-                        pass.set_bind_group(0, &analyzer.compute_bind_group, &[]);
-                        pass.set_pipeline(&self.decimate_upper_mid_pipeline);
-                        pass.dispatch_workgroups(
-                            (self.settings.sample_counts[3] * sample_multiplier).div_ceil(64),
-                            1,
-                            1,
-                        );
-                        pass.set_pipeline(&self.decimate_mid_pipeline);
-                        pass.dispatch_workgroups(
-                            (self.settings.sample_counts[2] * sample_multiplier).div_ceil(64),
-                            1,
-                            1,
-                        );
-                        pass.set_pipeline(&self.decimate_bass_pipeline);
-                        pass.dispatch_workgroups(
-                            (self.settings.sample_counts[1] * sample_multiplier).div_ceil(64),
-                            1,
-                            1,
-                        );
-                        pass.set_pipeline(&self.decimate_sub_bass_pipeline);
-                        pass.dispatch_workgroups(
-                            (self.settings.sample_counts[0] * sample_multiplier).div_ceil(64),
-                            1,
-                            1,
-                        );
-                        pass.set_pipeline(&self.compute_pipeline);
-                        pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
-                    }
-                }
-                if self.settings.frequency_smoothing_strength_percent > 0.0 {
-                    pass.set_pipeline(&self.frequency_smoothing_pipeline);
-                    pass.dispatch_workgroups(1, 1, 1);
                 }
                 pass.set_pipeline(&self.compose_display_pipeline);
                 pass.dispatch_workgroups(bin_count.div_ceil(64), 1, 1);
@@ -4336,7 +3529,7 @@ impl GpuState {
                 pass.set_bind_group(0, &analyzer.render_bind_group, &[]);
                 pass.draw(0..6, 0..rendered_bin_count);
                 if surface_mode && self.settings.surface_bar_depth_px.unwrap_or(0.0) > 0.0 {
-                    pass.set_pipeline(&self.prism_pipeline);
+                    pass.set_pipeline(self.prism_pipeline.as_ref().expect("active pipeline"));
                     pass.draw(0..volume_vertex_count, 0..rendered_bin_count);
                 } else {
                     pass.set_pipeline(&self.render_pipeline);
@@ -4345,7 +3538,7 @@ impl GpuState {
                 pass.set_pipeline(&self.peak_glow_pipeline);
                 pass.draw(0..6, 0..rendered_bin_count);
                 if surface_mode && self.settings.surface_bar_depth_px.unwrap_or(0.0) > 0.0 {
-                    pass.set_pipeline(&self.peak_volume_pipeline);
+                    pass.set_pipeline(self.peak_volume_pipeline.as_ref().expect("active pipeline"));
                     pass.draw(0..volume_vertex_count, 0..rendered_bin_count);
                 } else {
                     pass.set_pipeline(&self.peak_pipeline);
@@ -4353,7 +3546,11 @@ impl GpuState {
                 }
             }
             if self.settings.axis_labels_overlay {
-                pass.set_pipeline(&self.axis_overlay_pipeline);
+                pass.set_pipeline(
+                    self.axis_overlay_pipeline
+                        .as_ref()
+                        .expect("active pipeline"),
+                );
                 pass.set_bind_group(0, &self.analyzers[0].render_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -4419,7 +3616,11 @@ impl GpuState {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&self.peak_feedback_pipeline);
+                pass.set_pipeline(
+                    self.peak_feedback_pipeline
+                        .as_ref()
+                        .expect("active pipeline"),
+                );
                 pass.set_bind_group(
                     0,
                     &self.peak_feedback_bind_groups[peak_trail_input_index],
@@ -4482,7 +3683,7 @@ impl GpuState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_pipeline(self.composite_pipeline.as_ref().expect("active pipeline"));
             pass.set_bind_group(0, &self.composite_bind_groups[peak_trail_input_index], &[]);
             pass.draw(0..3, 0..1);
         }
@@ -4596,6 +3797,23 @@ fn storage_entry(
     }
 }
 
+fn visual_target_features(settings: &VisualizerSettings) -> (bool, bool, bool) {
+    let surface = settings.render_mode == RenderMode::Surface3d;
+    (
+        surface || settings.transparent_background,
+        surface && settings.surface_history_enabled,
+        surface && settings.surface_peak_trail_enabled,
+    )
+}
+
+fn target_size(size: PhysicalSize<u32>, enabled: bool) -> PhysicalSize<u32> {
+    if enabled {
+        size
+    } else {
+        PhysicalSize::new(1, 1)
+    }
+}
+
 fn create_visual_targets(
     device: &wgpu::Device,
     bind_group_layout: &wgpu::BindGroupLayout,
@@ -4603,6 +3821,7 @@ fn create_visual_targets(
     format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
     history_rows: u32,
+    history_enabled: bool,
     peak_trail_views: &[wgpu::TextureView; 2],
 ) -> (
     wgpu::Texture,
@@ -4631,8 +3850,16 @@ fn create_visual_targets(
     let surface_history_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("rendered spectrum history ring"),
         size: wgpu::Extent3d {
-            width: size.width.max(1),
-            height: history_rows.clamp(MIN_SURFACE_HISTORY_ROWS, MAX_SURFACE_HISTORY_ROWS),
+            width: if history_enabled {
+                size.width.max(1)
+            } else {
+                1
+            },
+            height: if history_enabled {
+                history_rows.clamp(MIN_SURFACE_HISTORY_ROWS, MAX_SURFACE_HISTORY_ROWS)
+            } else {
+                1
+            },
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -4783,30 +4010,6 @@ fn analysis_params(
             settings.frequency_focus_strength_percent * 0.01,
             settings.frequency_focus_origin_percent * 0.01,
         ],
-        attack_0: settings.attacks[..4].try_into().unwrap(),
-        attack_1: [
-            settings.attacks[4],
-            if settings.temporal_smoothing {
-                1.0
-            } else {
-                0.0
-            },
-            settings.analysis_window.shader_value(),
-            if settings.adaptive_triple_window {
-                2.0
-            } else if settings.adaptive_dual_window {
-                1.0
-            } else {
-                0.0
-            },
-        ],
-        decay_0: settings.decays[..4].try_into().unwrap(),
-        decay_1: [
-            settings.decays[4],
-            settings.adaptive_response_percent * 0.01,
-            settings.asymmetric_kaiser_beta,
-            settings.flanagan_alpha,
-        ],
         perception: [
             if settings.bar_layout == BarLayout::MusicalNotes {
                 1.0
@@ -4827,9 +4030,8 @@ fn analysis_params(
             },
             settings.peak_hold_ms * 0.001,
         ],
-        sample_counts_0: settings.sample_counts[..4].try_into().unwrap(),
-        sample_counts_1: [
-            settings.sample_counts[4],
+        capture: [
+            0,
             resonator_stream[0],
             u32::from(reset_resonators),
             u32::from(settings.resonator_multirate),
@@ -4849,12 +4051,6 @@ fn analysis_params(
             } else {
                 0.0
             },
-        ],
-        frequency_smoothing: [
-            settings.frequency_smoothing_strength_percent * 0.01,
-            settings.frequency_smoothing_50_hz_octaves,
-            settings.frequency_smoothing_10_khz_octaves,
-            settings.frequency_smoothing_max_lift_db,
         ],
         auditory_0: [
             settings.auditory_erb_bandwidth_scale,
@@ -4898,7 +4094,7 @@ fn analysis_params(
             settings.resonator_q_50_hz,
             settings.resonator_q_10_khz,
             settings.resonator_measurement.shader_value(),
-            settings.resonator_transient_assist_percent * 0.01,
+            0.0,
         ],
         resonator_decay: [
             settings.resonator_decay_db,
@@ -4908,29 +4104,16 @@ fn analysis_params(
         ],
         resonator_stream: resonator_stream[..4].try_into().unwrap(),
         hybrid: [
-            if settings.hybrid_adaptive_matching {
-                0.0
-            } else {
-                settings.hybrid_half_fft_gain_db
-            },
-            if settings.hybrid_adaptive_matching {
-                0.0
-            } else {
-                settings.hybrid_full_fft_gain_db
-            },
+            0.0,
+            0.0,
             if settings.analysis_method == AnalysisMethod::HybridResonatorFft {
                 1.0
             } else {
                 0.0
             },
-            settings.resonator_stage_count as f32,
+            1.0,
         ],
-        resonator_stream_extra: [
-            resonator_stream[4],
-            (settings.resonator_two_stage_q_percent * 1000.0).round() as u32,
-            0,
-            0,
-        ],
+        resonator_stream_extra: [resonator_stream[4], 0, 0, 0],
         hybrid_match_corrections,
     }
 }
@@ -4982,7 +4165,6 @@ fn multirate_config(settings: &VisualizerSettings) -> MultirateConfig {
             window_kind: settings.hybrid_fft_window.shader_value() as u32,
             kaiser_beta: settings.asymmetric_kaiser_beta,
             flanagan_alpha: settings.flanagan_alpha,
-            analysis_rate_hz: settings.hybrid_analysis_rate_hz,
         }
     } else if settings.analysis_method == AnalysisMethod::MultirateFft5 {
         MultirateConfig {
@@ -4994,7 +4176,6 @@ fn multirate_config(settings: &VisualizerSettings) -> MultirateConfig {
             window_kind: settings.multirate_fft5_window.shader_value() as u32,
             kaiser_beta: settings.asymmetric_kaiser_beta,
             flanagan_alpha: settings.flanagan_alpha,
-            analysis_rate_hz: settings.multirate_fft5_analysis_rate_hz,
         }
     } else {
         MultirateConfig {
@@ -5016,9 +4197,19 @@ fn multirate_config(settings: &VisualizerSettings) -> MultirateConfig {
             window_kind: settings.multirate_fft_window.shader_value() as u32,
             kaiser_beta: settings.asymmetric_kaiser_beta,
             flanagan_alpha: settings.flanagan_alpha,
-            analysis_rate_hz: settings.multirate_fft_analysis_rate_hz,
         }
     }
+}
+
+fn fft_magnitude_count(settings: &VisualizerSettings) -> usize {
+    if !settings.analysis_method.is_multirate_fft() {
+        return 1;
+    }
+    let config = multirate_config(settings);
+    config.fft_sizes[..config.band_count]
+        .iter()
+        .map(|size| size / 2 + 1)
+        .sum()
 }
 
 fn multirate_crossovers(settings: &VisualizerSettings) -> [f32; 4] {
@@ -5057,6 +4248,35 @@ fn display_bin_count(
         .clamp(32.0, MAX_BIN_COUNT as f32) as u32
 }
 
+fn analyzer_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
+    let compute_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("audio compute layout"),
+            entries: &[
+                storage_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                storage_entry(1, false, wgpu::ShaderStages::COMPUTE),
+                uniform_entry(2, wgpu::ShaderStages::COMPUTE),
+                storage_entry(3, false, wgpu::ShaderStages::COMPUTE),
+                storage_entry(4, false, wgpu::ShaderStages::COMPUTE),
+                storage_entry(5, false, wgpu::ShaderStages::COMPUTE),
+                storage_entry(6, false, wgpu::ShaderStages::COMPUTE),
+                storage_entry(7, false, wgpu::ShaderStages::COMPUTE),
+                storage_entry(8, false, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+    let render_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("audio render layout"),
+            entries: &[
+                storage_entry(7, true, wgpu::ShaderStages::VERTEX),
+                storage_entry(8, true, wgpu::ShaderStages::VERTEX),
+                uniform_entry(2, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(9, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+    (compute_bind_group_layout, render_bind_group_layout)
+}
+
 fn create_analyzer_channel(
     device: &wgpu::Device,
     compute_layout: &wgpu::BindGroupLayout,
@@ -5065,17 +4285,28 @@ fn create_analyzer_channel(
     history_sample_count: usize,
     channel_index: usize,
     channel_count: f32,
+    settings: &VisualizerSettings,
 ) -> AnalyzerChannel {
     let prefix = format!("channel {channel_index}");
+    let uses_resampler = matches!(
+        settings.analysis_method,
+        AnalysisMethod::ResonatorBank | AnalysisMethod::HybridResonatorFft
+    ) && settings.resonator_multirate;
+    let stream_size = |size| if uses_resampler { size } else { 1 };
+    let uses_samples = !matches!(
+        settings.analysis_method,
+        AnalysisMethod::MultirateFft | AnalysisMethod::MultirateFft5
+    );
+
     let sample_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(&format!("{prefix} audio samples")),
-        size: (SAMPLE_COUNT.max(MAX_MULTIRATE_MAGNITUDE_COUNT) * std::mem::size_of::<f32>()) as u64,
+        size: ((if uses_samples { SAMPLE_COUNT } else { 1 }) * std::mem::size_of::<f32>()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let fft_magnitude_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(&format!("{prefix} FFT magnitudes")),
-        size: (MAX_MULTIRATE_MAGNITUDE_COUNT * std::mem::size_of::<f32>()) as u64,
+        size: ((fft_magnitude_count(settings)) * std::mem::size_of::<f32>()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -5089,10 +4320,21 @@ fn create_analyzer_channel(
         &format!("{prefix} display spectrum bins"),
         MAX_BIN_COUNT as u64 * 4,
     );
-    let resonator_half_buffer = storage_buffer(device, &format!("{prefix} /2 samples"), 8192);
-    let resonator_quarter_buffer = storage_buffer(device, &format!("{prefix} /4 samples"), 4096);
-    let resonator_eighth_buffer = storage_buffer(device, &format!("{prefix} /8 samples"), 2048);
-    let resonator_sixteenth_buffer = storage_buffer(device, &format!("{prefix} /16 samples"), 1024);
+    let resonator_half_buffer =
+        storage_buffer(device, &format!("{prefix} /2 samples"), stream_size(8192));
+    let resonator_quarter_buffer =
+        storage_buffer(device, &format!("{prefix} /4 samples"), stream_size(4096));
+    let resonator_eighth_buffer =
+        storage_buffer(device, &format!("{prefix} /8 samples"), stream_size(2048));
+    let resonator_sixteenth_buffer = storage_buffer(
+        device,
+        &format!("{prefix} /16 samples"),
+        if uses_resampler && settings.resonator_five_stage {
+            1024
+        } else {
+            1
+        },
+    );
     let resonator_state_buffer = storage_buffer(
         device,
         &format!("{prefix} analysis auxiliary state"),
@@ -5187,6 +4429,7 @@ fn create_analyzer_channel(
         render_channel_buffer,
         multirate_fft: MultirateFft::default(),
         hybrid_band_matcher: HybridBandMatcher::default(),
+        fft_match_elapsed: 0.0,
         resonator_resampler: ResonatorResampler::default(),
         audio_history: vec![0.0; history_sample_count],
         samples: vec![0.0; SAMPLE_COUNT],
@@ -5283,10 +4526,391 @@ fn compute_pipeline(
     })
 }
 
+fn build_resonator_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("resonator.wgsl"));
+    compute_pipeline(device, layout, &shader, "resonator_pipeline", "resonate")
+}
+
+fn build_gammatone_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("gammatone.wgsl"));
+    compute_pipeline(device, layout, &shader, "gammatone_pipeline", "analyze_erb")
+}
+
+fn build_multirate_fft_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("multirate_fft.wgsl"));
+    compute_pipeline(device, layout, &shader, "multirate_fft_pipeline", "map_fft")
+}
+
+fn build_hybrid_fft_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("multirate_fft.wgsl"));
+    compute_pipeline(device, layout, &shader, "hybrid_fft_pipeline", "map_hybrid")
+}
+
+fn build_axis_overlay_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("visualizer.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("frequency axis label overlay"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("grid_vs"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("axis_overlay_fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_prism_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("visualizer.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("dyadic layered spectrum volume"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("prism_vs"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("prism_fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_peak_volume_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("visualizer.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("dyadic layered peak indicators"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("peak_volume_vs"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("peak_fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_composite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("luminance-to-alpha compositor"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_peak_feedback_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("peak_feedback.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("moving peak temporal feedback"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BarLayout, VisualizerSettings, display_bin_count, visual_delay_ms};
+    use super::*;
     use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn removed_settings_migrate_without_losing_active_settings() {
+        let old = r#"{"analysis_method":"WindowedDft","gain":2.4,"bottom_mirror":true,
+            "temporal_smoothing":true,"frequency_smoothing_strength_percent":90.0,
+            "resonator_stage_count":2,"resonator_transient_assist_percent":70.0,
+            "hybrid_half_fft_gain_db":9.0,"fft_sync_to_display":false,
+            "hybrid_analysis_rate_hz":60.0}"#;
+        let settings = serde_json::from_str::<VisualizerSettings>(old)
+            .unwrap()
+            .sanitized();
+        assert_eq!(settings.analysis_method, AnalysisMethod::ResonatorBank);
+        assert_eq!(settings.gain, 2.4);
+        assert!(settings.bottom_mirror);
+        assert_eq!(settings.fft_display_divisor, 1);
+        let saved = serde_json::to_value(&settings).unwrap();
+        for field in [
+            "temporal_smoothing",
+            "frequency_smoothing_strength_percent",
+            "resonator_stage_count",
+            "resonator_transient_assist_percent",
+            "hybrid_half_fft_gain_db",
+            "fft_sync_to_display",
+            "hybrid_analysis_rate_hz",
+        ] {
+            assert!(saved.get(field).is_none(), "obsolete field {field}");
+        }
+        let invalid = VisualizerSettings {
+            fft_display_divisor: 99,
+            ..settings
+        };
+        assert_eq!(invalid.sanitized().fft_display_divisor, 4);
+    }
+
+    #[test]
+    fn visual_resources_follow_enabled_effects() {
+        let mut settings = VisualizerSettings::default();
+        assert_eq!(visual_target_features(&settings), (false, false, false));
+        settings.surface_history_enabled = true;
+        settings.surface_peak_trail_enabled = true;
+        assert_eq!(visual_target_features(&settings), (false, false, false));
+        settings.transparent_background = true;
+        assert_eq!(visual_target_features(&settings), (true, false, false));
+        settings.render_mode = RenderMode::Surface3d;
+        assert_eq!(visual_target_features(&settings), (true, true, true));
+        assert_eq!(
+            target_size(PhysicalSize::new(1920, 1080), false),
+            PhysicalSize::new(1, 1)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn gpu_analyzers_validate_with_lazy_buffers() {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL,
+                ..Default::default()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .unwrap();
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let (compute_layout, render_layout) = analyzer_layouts(&device);
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&compute_layout],
+                push_constant_ranges: &[],
+            });
+            let render_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&render_layout],
+                    push_constant_ranges: &[],
+                });
+            let shader = device.create_shader_module(wgpu::include_wgsl!("analysis.wgsl"));
+            let compose = compute_pipeline(
+                &device,
+                &pipeline_layout,
+                &shader,
+                "compose",
+                "compose_display",
+            );
+            for method in [
+                AnalysisMethod::ResonatorBank,
+                AnalysisMethod::HybridResonatorFft,
+                AnalysisMethod::MultirateFft,
+                AnalysisMethod::MultirateFft5,
+                AnalysisMethod::AuditoryErb,
+            ] {
+                for multirate in [false, true] {
+                    for five_stage in [false, true] {
+                        let settings = VisualizerSettings {
+                            analysis_method: method,
+                            resonator_multirate: multirate,
+                            resonator_five_stage: five_stage,
+                            ..VisualizerSettings::default()
+                        };
+                        let params = analysis_params(
+                            &settings,
+                            [48000.0, 0.0, 1.0 / 60.0],
+                            16,
+                            true,
+                            ([0; 5], true),
+                            [0.0; 4],
+                            PhysicalSize::new(320, 180),
+                        );
+                        let analyzer = create_analyzer_channel(
+                            &device,
+                            &compute_layout,
+                            &render_layout,
+                            &params,
+                            HISTORY_SAMPLE_COUNT,
+                            0,
+                            1.0,
+                            &settings,
+                        );
+                        assert_eq!(
+                            analyzer.fft_magnitude_buffer.size() > 4,
+                            method.is_multirate_fft()
+                        );
+                        assert_eq!(
+                            analyzer.resonator_half_buffer.size() > 4,
+                            multirate
+                                && matches!(
+                                    method,
+                                    AnalysisMethod::ResonatorBank
+                                        | AnalysisMethod::HybridResonatorFft
+                                )
+                        );
+                        let pipeline = match method {
+                            AnalysisMethod::ResonatorBank | AnalysisMethod::HybridResonatorFft => {
+                                build_resonator_pipeline(&device, &pipeline_layout)
+                            }
+                            AnalysisMethod::AuditoryErb => {
+                                build_gammatone_pipeline(&device, &pipeline_layout)
+                            }
+                            _ => build_multirate_fft_pipeline(&device, &pipeline_layout),
+                        };
+                        let hybrid = (method == AnalysisMethod::HybridResonatorFft)
+                            .then(|| build_hybrid_fft_pipeline(&device, &pipeline_layout));
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        {
+                            let mut pass = encoder.begin_compute_pass(&Default::default());
+                            pass.set_pipeline(&pipeline);
+                            pass.set_bind_group(
+                                0,
+                                if matches!(
+                                    method,
+                                    AnalysisMethod::MultirateFft | AnalysisMethod::MultirateFft5
+                                ) {
+                                    &analyzer.fft_compute_bind_group
+                                } else {
+                                    &analyzer.compute_bind_group
+                                },
+                                &[],
+                            );
+                            pass.dispatch_workgroups(1, 1, 1);
+                            if let Some(hybrid) = &hybrid {
+                                pass.set_pipeline(hybrid);
+                                pass.set_bind_group(0, &analyzer.fft_compute_bind_group, &[]);
+                                pass.dispatch_workgroups(1, 1, 1);
+                            }
+                            pass.set_pipeline(&compose);
+                            pass.set_bind_group(0, &analyzer.compute_bind_group, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        queue.submit([encoder.finish()]);
+                    }
+                }
+            }
+            let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+            let _ = build_prism_pipeline(&device, &render_pipeline_layout, format);
+            let _ = build_peak_volume_pipeline(&device, &render_pipeline_layout, format);
+            let _ = build_axis_overlay_pipeline(&device, &render_pipeline_layout, format);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert!(device.pop_error_scope().await.is_none());
+        });
+    }
 
     #[test]
     fn settings_json_round_trip() {

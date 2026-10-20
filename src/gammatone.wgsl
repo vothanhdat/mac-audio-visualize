@@ -5,17 +5,11 @@ struct Params {
     bin_count: u32,
     resolution: vec2<f32>,
     axis_focus: vec2<f32>,
-    attack_0: vec4<f32>,
-    attack_1: vec4<f32>,
-    decay_0: vec4<f32>,
-    decay_1: vec4<f32>,
     perception: vec4<f32>,
     visual: vec4<f32>,
-    sample_counts_0: vec4<u32>,
-    sample_counts_1: vec4<u32>,
+    capture: vec4<u32>,
     db_scale: vec4<f32>,
     frequency_range: vec4<f32>,
-    frequency_smoothing: vec4<f32>,
     auditory_0: vec4<f32>,
     auditory_1: vec4<f32>,
     fft_sizes_0: vec4<u32>,
@@ -78,7 +72,7 @@ fn analyze_erb(@builtin(global_invocation_id) id: vec3<u32>) {
     let upper = min(params.frequency_range.y, params.sample_rate * 0.48);
     let frequency = lower * pow(upper / lower, frequency_t);
     let floor_db = local_db_floor(frequency_t);
-    let reset = params.sample_counts_1.z != 0u;
+    let reset = params.capture.z != 0u;
 
     // Three vec4 values per bin: oscillator + stage 1, stages 2/3,
     // and stage 4. Cascading four complex one-pole sections produces the
@@ -120,7 +114,7 @@ fn analyze_erb(@builtin(global_invocation_id) id: vec3<u32>) {
     let damping = exp(-2.0 * PI * bandwidth_hz / params.sample_rate);
     let feed = 1.0 - damping;
     let order = u32(clamp(round(params.auditory_0.z), 1.0, 4.0));
-    let new_count = min(params.sample_counts_1.y, MAX_SAMPLE_COUNT);
+    let new_count = min(params.capture.y, MAX_SAMPLE_COUNT);
     let start = MAX_SAMPLE_COUNT - new_count;
     var previous_output = selected_stage(order, stage_0, stage_1, stage_2, stage_3);
     var phase_sum = vec2(0.0);

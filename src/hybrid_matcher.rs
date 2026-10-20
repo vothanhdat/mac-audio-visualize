@@ -245,7 +245,6 @@ mod tests {
             window_kind: 0,
             kaiser_beta: 8.0,
             flanagan_alpha: 8.0,
-            analysis_rate_hz: 120.0,
         };
         let match_config = HybridMatchConfig {
             frequencies_hz: [4500.0, 4700.0, 4900.0, 7400.0, 7800.0, 8000.0],
@@ -256,10 +255,7 @@ mod tests {
         };
         let mut fft = MultirateFft::default();
         fft.reset(fft_config, &history);
-        let mut magnitudes = fft
-            .analyze_if_due(sample_rate, true, true)
-            .unwrap()
-            .to_vec();
+        let mut magnitudes = fft.analyze_if_due(true, 1).unwrap().to_vec();
         for magnitude in &mut magnitudes[..=fft_config.fft_sizes[0] / 2] {
             *magnitude *= 10.0;
         }

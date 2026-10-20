@@ -5,14 +5,9 @@ struct Params {
     bin_count: u32,
     resolution: vec2<f32>,
     axis_focus: vec2<f32>,
-    attack_0: vec4<f32>,
-    attack_1: vec4<f32>,
-    decay_0: vec4<f32>,
-    decay_1: vec4<f32>,
     perception: vec4<f32>,
     visual: vec4<f32>,
-    sample_counts_0: vec4<u32>,
-    sample_counts_1: vec4<u32>,
+    capture: vec4<u32>,
     db_scale: vec4<f32>,
     frequency_range: vec4<f32>,
 }
@@ -46,7 +41,7 @@ const RIGHT: f32 = 0.0;
 const TOP: f32 = 20.0;
 const BOTTOM: f32 = 32.0;
 const MAX_BIN_COUNT: u32 = 2048u;
-const SMOOTHING_OFFSET: u32 = MAX_BIN_COUNT * 3u;
+const HIGHLIGHT_OFFSET: u32 = MAX_BIN_COUNT * 3u;
 
 struct GridOut {
     @builtin(position) position: vec4<f32>,
@@ -487,7 +482,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let width = max(pitch - params.frequency_range.z, 0.5);
     let x_px = bar_center_x(bin) - width * 0.5 + corner.x * width;
     let detailed = spectrum[bin].x;
-    let response = auxiliary[SMOOTHING_OFFSET + bin].w;
+    let response = auxiliary[HIGHLIGHT_OFFSET + bin].w;
     let displayed = detailed;
     let y_px = bar_y(corner.y, displayed, instance);
 
@@ -586,7 +581,7 @@ fn prism_vs(
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
     out.response = layer_t;
     out.reflection_alpha = select(0.0, 1.0, final_layer);
-    out.transient = auxiliary[SMOOTHING_OFFSET + bin].w;
+    out.transient = auxiliary[HIGHLIGHT_OFFSET + bin].w;
     return out;
 }
 
@@ -655,7 +650,7 @@ fn glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     out.uv = corner;
     out.energy = energy;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
-    out.response = auxiliary[SMOOTHING_OFFSET + bin].w;
+    out.response = auxiliary[HIGHLIGHT_OFFSET + bin].w;
     out.reflection_alpha = reflection_alpha(corner.y, instance);
     out.transient = out.response;
     return out;
@@ -699,7 +694,7 @@ fn peak_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     out.uv = corner;
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
-    out.response = auxiliary[SMOOTHING_OFFSET + bin].z;
+    out.response = auxiliary[HIGHLIGHT_OFFSET + bin].z;
     out.reflection_alpha = reflection_alpha(peak, instance);
     out.transient = 0.0;
     return out;
@@ -750,7 +745,7 @@ fn peak_volume_vs(
     out.uv = corner;
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
-    out.response = auxiliary[SMOOTHING_OFFSET + bin].z;
+    out.response = auxiliary[HIGHLIGHT_OFFSET + bin].z;
     let depth_brightness =
         clamp(render_channel.peak_depth_brightness_percent * 0.01, 0.0, 1.0);
     let rear_layer_alpha =
@@ -784,7 +779,7 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     let bin = spectrum_bin(instance);
     let pitch = channel_pitch();
     let core_width = max(pitch - params.frequency_range.z, 0.5);
-    let response = auxiliary[SMOOTHING_OFFSET + bin].z;
+    let response = auxiliary[HIGHLIGHT_OFFSET + bin].z;
     let onset = response * params.frequency_range.w;
     let width = core_width + 8.0 + onset * 16.0;
     let height = 6.0 + onset * 10.0;

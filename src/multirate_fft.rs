@@ -8,7 +8,6 @@ pub struct MultirateConfig {
     pub window_kind: u32,
     pub kaiser_beta: f32,
     pub flanagan_alpha: f32,
-    pub analysis_rate_hz: f32,
 }
 
 pub struct MultirateFft {
@@ -17,6 +16,8 @@ pub struct MultirateFft {
     work: Vec<[f32; 2]>,
     packed_magnitudes: Vec<f32>,
     samples_since_analysis: usize,
+    frames_until_analysis: u32,
+    display_divisor: u32,
 }
 
 impl Default for MultirateFft {
@@ -27,6 +28,8 @@ impl Default for MultirateFft {
             work: Vec::new(),
             packed_magnitudes: Vec::new(),
             samples_since_analysis: 0,
+            frames_until_analysis: 0,
+            display_divisor: 1,
         }
     }
 }
@@ -64,6 +67,7 @@ impl MultirateFft {
             }
         }
         self.samples_since_analysis = usize::MAX / 2;
+        self.frames_until_analysis = 0;
     }
 
     pub fn ingest(&mut self, samples: &[f32]) {
@@ -88,33 +92,22 @@ impl MultirateFft {
             || current.flanagan_alpha != config.flanagan_alpha
     }
 
-    pub fn set_analysis_rate(&mut self, analysis_rate_hz: f32) {
-        if let Some(config) = &mut self.config {
-            config.analysis_rate_hz = analysis_rate_hz;
-        }
-    }
-
-    pub fn analyze_if_due(
-        &mut self,
-        sample_rate: f32,
-        force: bool,
-        sync_to_display: bool,
-    ) -> Option<&[f32]> {
+    pub fn analyze_if_due(&mut self, force: bool, display_divisor: u32) -> Option<&[f32]> {
         let config = self.config?;
-        if sync_to_display {
-            if !force && self.samples_since_analysis == 0 {
-                return None;
-            }
-            self.samples_since_analysis = 0;
-        } else {
-            let hop = (sample_rate / config.analysis_rate_hz.max(1.0))
-                .round()
-                .max(1.0) as usize;
-            if !force && self.samples_since_analysis < hop {
-                return None;
-            }
-            self.samples_since_analysis %= hop;
+        let divisor = display_divisor.clamp(1, 4);
+        if self.display_divisor != divisor {
+            self.display_divisor = divisor;
+            self.frames_until_analysis = 0;
         }
+        if !force && self.frames_until_analysis > 0 {
+            self.frames_until_analysis -= 1;
+            return None;
+        }
+        if !force && self.samples_since_analysis == 0 {
+            return None;
+        }
+        self.frames_until_analysis = divisor - 1;
+        self.samples_since_analysis = 0;
 
         let mut offset = 0;
         for band in &self.bands[..config.band_count] {
@@ -366,6 +359,41 @@ mod tests {
     }
 
     #[test]
+    fn fractional_display_rates_keep_ingesting_between_fft_updates() {
+        for divisor in 1..=4 {
+            let config = MultirateConfig {
+                band_count: 1,
+                fft_sizes: [128, 0, 0, 0, 0],
+                decimations: [1, 0, 0, 0, 0],
+                window_kind: 0,
+                kaiser_beta: 8.0,
+                flanagan_alpha: 8.0,
+            };
+            let mut fft = MultirateFft::default();
+            fft.reset(config, &[0.0; 128]);
+            for frame in 0..13 {
+                fft.ingest(&[1.0; 128]);
+                let result = fft.analyze_if_due(frame == 0, divisor);
+                assert_eq!(
+                    result.is_some(),
+                    frame % divisor == 0,
+                    "frame {frame}, divisor {divisor}"
+                );
+                if let Some(magnitudes) = result {
+                    assert!((magnitudes[0] - 2.0).abs() < 0.001);
+                }
+            }
+            // Changing cadence and reset requests take effect immediately.
+            fft.ingest(&[0.0]);
+            assert!(
+                fft.analyze_if_due(false, if divisor == 4 { 1 } else { divisor + 1 })
+                    .is_some()
+            );
+            assert!(fft.analyze_if_due(true, 4).is_some());
+        }
+    }
+
+    #[test]
     fn display_sync_analyzes_once_for_each_new_audio_batch() {
         let config = MultirateConfig {
             band_count: 1,
@@ -374,15 +402,14 @@ mod tests {
             window_kind: 0,
             kaiser_beta: 8.0,
             flanagan_alpha: 8.0,
-            analysis_rate_hz: 1.0,
         };
         let mut fft = MultirateFft::default();
         fft.reset(config, &[0.0; 128]);
 
-        assert!(fft.analyze_if_due(44_100.0, true, true).is_some());
-        assert!(fft.analyze_if_due(44_100.0, false, true).is_none());
+        assert!(fft.analyze_if_due(true, 1).is_some());
+        assert!(fft.analyze_if_due(false, 1).is_none());
         fft.ingest(&[0.25]);
-        assert!(fft.analyze_if_due(44_100.0, false, true).is_some());
-        assert!(fft.analyze_if_due(44_100.0, false, true).is_none());
+        assert!(fft.analyze_if_due(false, 1).is_some());
+        assert!(fft.analyze_if_due(false, 1).is_none());
     }
 }

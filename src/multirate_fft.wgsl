@@ -5,17 +5,11 @@ struct Params {
     bin_count: u32,
     resolution: vec2<f32>,
     axis_focus: vec2<f32>,
-    attack_0: vec4<f32>,
-    attack_1: vec4<f32>,
-    decay_0: vec4<f32>,
-    decay_1: vec4<f32>,
     perception: vec4<f32>,
     visual: vec4<f32>,
-    sample_counts_0: vec4<u32>,
-    sample_counts_1: vec4<u32>,
+    capture: vec4<u32>,
     db_scale: vec4<f32>,
     frequency_range: vec4<f32>,
-    frequency_smoothing: vec4<f32>,
     auditory_0: vec4<f32>,
     auditory_1: vec4<f32>,
     fft_sizes_0: vec4<u32>,
@@ -110,26 +104,6 @@ fn level_from_magnitude(magnitude: f32, frequency_t: f32) -> f32 {
     );
 }
 
-fn temporal_level(measured: f32, previous: f32, frequency: f32) -> f32 {
-    if (params.attack_1.y <= 0.5) { return measured; }
-    var attack = params.attack_1.x;
-    var decay = params.decay_1.x;
-    if (frequency < 80.0) {
-        attack = params.attack_0.x;
-        decay = params.decay_0.x;
-    } else if (frequency < 320.0) {
-        attack = params.attack_0.y;
-        decay = params.decay_0.y;
-    } else if (frequency < 1280.0) {
-        attack = params.attack_0.z;
-        decay = params.decay_0.z;
-    } else if (frequency < 5120.0) {
-        attack = params.attack_0.w;
-        decay = params.decay_0.w;
-    }
-    return mix(measured, previous, select(decay, attack, measured > previous));
-}
-
 @compute @workgroup_size(64)
 fn map_fft(@builtin(global_invocation_id) id: vec3<u32>) {
     let bin = id.x;
@@ -141,7 +115,7 @@ fn map_fft(@builtin(global_invocation_id) id: vec3<u32>) {
     let frequency = lower * pow(upper / lower, frequency_t);
     let measured = level_from_magnitude(multirate_magnitude(frequency), frequency_t);
     let previous = spectrum[bin];
-    let output = temporal_level(measured, previous.x, frequency);
+    let output = measured;
     spectrum[bin] = vec4(output, previous.y, 0.0, 0.0);
 }
 
@@ -164,15 +138,12 @@ fn map_hybrid(@builtin(global_invocation_id) id: vec3<u32>) {
         params.hybrid_match_corrections.x,
         fft_band == 0u,
     );
-    let gain_db =
-        select(params.hybrid.y, params.hybrid.x, fft_band == 0u)
-        + adaptive_correction_db;
+    let gain_db = adaptive_correction_db;
     let band_gain = exp2(gain_db / 6.020599913);
     let measured = level_from_magnitude(
         magnitude_at(fft_band, frequency) * band_gain,
         frequency_t,
     );
-    let fft_history = select(previous.w, measured, params.perception.y > 0.5);
-    let fft_level = temporal_level(measured, fft_history, frequency);
+    let fft_level = measured;
     spectrum[bin] = vec4(fft_level, previous.y, 0.0, fft_level);
 }

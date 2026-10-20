@@ -3,7 +3,8 @@
 A low-latency macOS audio visualizer written in Rust. By default it captures
 system audio through a native Core Audio process tap on macOS 14.2 or newer,
 moves synchronized stereo samples through a lock-free SPSC ring, and
-runs spectral analysis plus rendering on the GPU through `wgpu`/Metal and WGSL.
+combines CPU FFTs with GPU resonator analysis and rendering through `wgpu`/Metal
+and WGSL.
 The optional transparent-background mode renders normally onto opaque black,
 then a GPU compositor converts RGB light intensity into a clean premultiplied
 alpha channel. It is disabled by default; the detached controls stay opaque.
@@ -12,6 +13,10 @@ buttons remain available and dragging anywhere in the canvas moves the window.
 Visualizer controls are restored on startup from
 `~/Library/Application Support/VisualAudio/settings.json`; edits are saved
 automatically after a short debounce.
+New profiles and **Reset** use the saved configuration adopted on October 20,
+2026: gain 1.7, hybrid resonator + FFT with adaptive matching, 3 px bars, a bottom
+mirror, and a 16 Hz–22.5 kHz frequency range. Existing profiles keep their saved
+settings. Automatic output synchronization is enabled by default.
 
 ## System audio capture (default)
 
@@ -97,7 +102,7 @@ cargo run --release -- --device "BlackHole 2ch"
 Run independent named profiles to compare two configurations at the same time:
 
 ```bash
-target/release/visual-audio --profile dft
+target/release/visual-audio --profile hybrid
 target/release/visual-audio --profile resonator
 ```
 
@@ -109,72 +114,53 @@ Use **Up** or **+** to increase visual gain, **Down** or **-** to decrease it,
 **H** to hide/show the detached controls window, right-click the visualizer to
 show and focus it, and **Esc** to quit.
 
-The in-window controls apply immediately without shader recompilation. They
-include visual gain, optional attack and decay smoothing for all five frequency
-bands, adjustable bar brightness and peak indicators, automatic output latency
-compensation with an adjustable 0–1,000 ms total visual delay
-for output-device synchronization, global and independent per-band DFT sample
-sizes, fixed pixel bar width, adjustable 0–12 px bar spacing with a
-resize-responsive bar count, and a reset
-button.
+Controls apply immediately. Analyzer controls follow the selected method; inactive
+settings are hidden. New profiles default to hybrid resonator + FFT with adaptive
+level matching. DFT, temporal/frequency smoothing, manual hybrid FFT gains,
+two-stage resonators, and transient assistance have been removed. Old DFT
+profiles migrate to the resonator bank; obsolete fields are ignored when loading
+and omitted on the next settings save. Other saved settings are retained.
+
+**FFT update rate** offers **1×, ½×, ⅓×, or ¼× display** in hybrid and standalone
+FFT modes. At 60 visual frames per second these produce approximately 60, 30,
+20, or 15 FFT updates per second. Audio continues accumulating between updates,
+while bars, peaks, and resonators animate every visual frame. The default is 1×;
+old fixed-rate settings migrate to that default. Lower rates save FFT work but
+can add up to three visual frames of FFT response delay.
 
 ## Performance design
 
 - The CoreAudio callback writes synchronized stereo into a preallocated,
-  lock-free ring: no locks, allocations, FFTs, logging, or GPU calls occur there.
-- The render loop uploads a 16,384-sample history (64 KiB) each frame, reserving
-  enough recent audio for every band's largest selectable window.
-- GPU FIR preprocessing builds five analysis rates. Their default DFT sizes are
-  sub-bass ÷64 (128 samples), bass ÷32 (256), low-mid ÷8 (512), upper-mid ÷2
-  (1,024), and high full-rate (2,048); each can independently select half,
-  standard, or double size. Adjacent bands overlap and crossfade around 80 Hz,
-  320 Hz, 1.28 kHz, and 5.12 kHz, preventing visible crossover steps. A 512-way
-  compute pass maps these streams onto a configurable log-spaced display (35
-  Hz–22 kHz by default, selectable from 16–200 Hz at the low end and 10–40 kHz
-  at the high end). A smooth two-control frequency lens can expand frequencies
-  around a logarithmic origin or compact them in favor of bass and treble;
-  50% strength is the exact unmodified logarithmic scale.
-- An optional `1× + 2× Adaptive` mode uses the short window for fresh attacks,
-  then settles onto the sharper double-length spectrum. Its response amount is
-  configurable and defaults to 50%. A `0.5× + 1× + 2× Adaptive` mode adds an
-  independently tracked half-length leading-edge stage for the quickest
-  response while retaining the 2× steady spectrum.
-- Each band is evaluated directly at every log-spaced display frequency,
-  avoiding the low-bin stair stepping that FFT visualizers need interpolation
-  to hide. There is no separate responsive-bass or leakage-cleanup path.
-- Temporal smoothing is optional and disabled by default, exposing each
-  frame's direct DFT result.
-- Multirate FFT analysis is available in independent 3-band and 5-band modes.
-  The 5-band default uses crossovers at 80 Hz, 320 Hz, 1.28 kHz, and 5.12 kHz,
-  with decimation factors ÷128, ÷64, ÷16, ÷4, and ÷1. Every band exposes its
-  FFT size and decimation, and adjacent spectra crossfade smoothly.
-- Higher-band decay smoothing is also frequency-dependent: 320 Hz–1.28 kHz
-  uses 0.78, 1.28–5.12 kHz uses 0.84, and 5.12–22 kHz uses 0.87.
-- All five analysis bands share a selectable Hann, causal Half-Hann,
-  Half-Blackman, Asymmetric Kaiser, or Flanagan auditory-model window with
-  coherent-gain normalization. Kaiser β is configurable from 0–16 and
-  Flanagan α from 2–24; both default to 8. Half-Blackman is the default.
-- A single instanced draw renders a window-width-dependent bar count (up to
-  2,048); there are no CPU-built meshes.
-- The GPU-rendered frequency axis defaults to 35 Hz–22 kHz and can be adjusted.
-  Its actual upper limit is capped below the input Nyquist frequency. The
-  vertical mapping uses a configurable smooth floor curve, defaulting to -56
-  dB at the low endpoint and -78 dB at the high endpoint, with no fixed dB axis.
-- Mailbox VSync (FIFO fallback) is automatically paced to the active display
-  refresh rate without blocking the macOS event thread. GPU work is deferred
-  briefly during live window movement and resize.
+  lock-free ring without allocating, locking, analyzing, or calling the GPU.
+- Hybrid mode uses multirate GPU resonators below about 0.091 × sample rate,
+  then half-rate and full-rate CPU FFTs above that boundary. Default FFT sizes
+  are 1,024 and 512 samples with an Asymmetric Kaiser window (β = 8.1).
+  Adaptive matching adjusts FFT levels against reference resonators.
+- The resonator bank processes newly captured samples. Frequency-dependent Q
+  varies smoothly between 50 Hz and 10 kHz. Its output envelope has configurable
+  decay and peak/decay ordering. Optional multirate processing, a fifth /16 stage,
+  and timestamp alignment remain available.
+- Standalone 3-band and 5-band FFT modes and the auditory ERB analyzer remain
+  selectable. FFT modes expose band sizes, decimation, crossover frequencies,
+  and normalized Hann, Half-Hann, Half-Blackman, Kaiser, or Flanagan windows.
+- Only active analysis pipelines and channel analyzers are created. Mono uses
+  one analyzer; stereo creates a second on demand and releases it on returning
+  to mono. FFT magnitude buffers fit the selected sizes. Inactive resampling
+  buffers use minimal binding placeholders.
+- 3D, transparency, axis-overlay, and peak-feedback pipelines are created when
+  enabled and released when disabled. Full-size render/history/trail textures
+  are allocated only for enabled effects; inactive texture bindings use 1×1
+  placeholders. Resizing and effect changes recreate the required targets.
+- GPU display composition handles bar gravity, peak momentum/hold, and rise
+  highlights every visual frame. One instanced draw per layer renders up to
+  2,048 bars without CPU-built meshes.
+- The default frequency range is 16 Hz–22.5 kHz, capped below input Nyquist.
+  The smooth floor curve defaults to -51 dB at the low end and -62 dB at the
+  high end. Fixed-width bars support a configurable frequency focus lens;
+  musical-note layout gives each semitone equal width.
+- Mailbox VSync (FIFO fallback) follows the active display's refresh rate. GPU
+  work is briefly deferred during live window movement and resize.
 
-The current analyzer is a log-spaced GPU DFT, chosen because it directly spends
-work on visually useful bins. For very large linear spectra (8K–64K samples), a
-multi-pass radix-2 FFT would scale better.
-
-An experimental GPU resonator-bank analysis method is also available for direct
-comparison. It maintains one complex state per displayed frequency and normally
-processes only newly captured samples. Its frequency-dependent Q controls are
-smoothly interpolated between 50 Hz and 10 kHz. A separate output-decay control
-expresses exponential amplitude decay as a dB amount over a time interval. Its
-envelope can either decay the previous value before capturing a new peak, or capture
-and display the peak first while saving its decayed value for the next update.
-Neither mode uses a sample memory window.
-Frequency mapping, delay, resonator tuning, or bar-layout changes reset and warm
-those states from the available history.
+Run CPU and shader-validation checks with `cargo test --offline`. The additional
+Metal resource check can be run on a Mac with
+`cargo test --offline gpu_analyzers_validate_with_lazy_buffers -- --ignored`.

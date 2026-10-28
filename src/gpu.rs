@@ -19,6 +19,10 @@ use crate::{
     resonator_resampler::ResonatorResampler,
 };
 
+#[path = "static_grid.rs"]
+mod static_grid;
+use static_grid::StaticGrid;
+
 // Audio block used for streaming analyzer warm-up and output-delay alignment.
 pub const SAMPLE_COUNT: usize = 16_384;
 const HISTORY_SAMPLE_COUNT: usize = 65_536;
@@ -2035,7 +2039,7 @@ pub struct GpuState {
     multirate_fft_pipeline: Option<wgpu::ComputePipeline>,
     hybrid_fft_pipeline: Option<wgpu::ComputePipeline>,
     compose_display_pipeline: wgpu::ComputePipeline,
-    grid_pipeline: wgpu::RenderPipeline,
+    static_grid: StaticGrid,
     axis_overlay_pipeline: Option<wgpu::RenderPipeline>,
     glow_pipeline: wgpu::RenderPipeline,
     render_pipeline: wgpu::RenderPipeline,
@@ -2107,6 +2111,7 @@ struct AnalyzerChannel {
     render_bind_group: wgpu::BindGroup,
     sample_buffer: wgpu::Buffer,
     fft_magnitude_buffer: wgpu::Buffer,
+    spectrum_buffer: wgpu::Buffer,
     resonator_half_buffer: wgpu::Buffer,
     resonator_quarter_buffer: wgpu::Buffer,
     resonator_eighth_buffer: wgpu::Buffer,
@@ -2261,31 +2266,12 @@ impl GpuState {
         );
 
         let render_shader = device.create_shader_module(wgpu::include_wgsl!("visualizer.wgsl"));
-        let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("logarithmic frequency axis"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("grid_vs"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("grid_fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let static_grid = StaticGrid::new(
+            &device,
+            &render_bind_group_layout,
+            &render_shader,
+            format,
+        );
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("spectrum renderer"),
@@ -2605,7 +2591,7 @@ impl GpuState {
             multirate_fft_pipeline: None,
             hybrid_fft_pipeline: None,
             compose_display_pipeline,
-            grid_pipeline,
+            static_grid,
             axis_overlay_pipeline: None,
             glow_pipeline,
             render_pipeline,
@@ -3230,18 +3216,20 @@ impl GpuState {
                         bytemuck::cast_slice(magnitudes),
                     );
                 }
-                if self.settings.analysis_method == AnalysisMethod::HybridResonatorFft {
-                    self.queue.write_buffer(
-                        &analyzer.sample_buffer,
-                        0,
-                        bytemuck::cast_slice(uploaded_samples),
-                    );
-                }
-            } else {
-                self.queue.write_buffer(
+            }
+            if matches!(
+                self.settings.analysis_method,
+                AnalysisMethod::ResonatorBank
+                    | AnalysisMethod::HybridResonatorFft
+                    | AnalysisMethod::AuditoryErb
+            ) {
+                // Streaming shaders read only this suffix. A reset already
+                // expands the count to the full analyzer warm-up window.
+                upload_audio_samples(
+                    &self.queue,
                     &analyzer.sample_buffer,
-                    0,
-                    bytemuck::cast_slice(uploaded_samples),
+                    uploaded_samples,
+                    resonator_sample_count as usize,
                 );
             }
 
@@ -3450,6 +3438,13 @@ impl GpuState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("visual-audio frame"),
             });
+        self.static_grid.prepare(
+            &self.device,
+            &mut encoder,
+            &self.analyzers[0].render_bind_group,
+            self.size,
+            &self.settings,
+        );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("GPU spectrum analysis"),
@@ -3521,9 +3516,8 @@ impl GpuState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.grid_pipeline);
-            pass.set_bind_group(0, &self.analyzers[0].render_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            self.static_grid
+                .draw(&mut pass, &self.analyzers[0].render_bind_group);
             for analyzer in &self.analyzers[..active_channel_count] {
                 pass.set_pipeline(&self.glow_pipeline);
                 pass.set_bind_group(0, &analyzer.render_bind_group, &[]);
@@ -3546,6 +3540,15 @@ impl GpuState {
                 }
             }
             if self.settings.axis_labels_overlay {
+                // The overlay font occupies only these ten physical pixel rows.
+                // Scissoring also avoids launching fragments elsewhere.
+                let label_y = self.size.height.saturating_sub(14);
+                pass.set_scissor_rect(
+                    0,
+                    label_y,
+                    self.size.width,
+                    10.min(self.size.height - label_y),
+                );
                 pass.set_pipeline(
                     self.axis_overlay_pipeline
                         .as_ref()
@@ -4421,6 +4424,7 @@ fn create_analyzer_channel(
         render_bind_group,
         sample_buffer,
         fft_magnitude_buffer,
+        spectrum_buffer,
         resonator_half_buffer,
         resonator_quarter_buffer,
         resonator_eighth_buffer,
@@ -4497,6 +4501,22 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+fn upload_audio_samples(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    samples: &[f32],
+    new_count: usize,
+) {
+    if new_count > 0 {
+        let start = samples.len() - new_count;
+        queue.write_buffer(
+            buffer,
+            (start * std::mem::size_of::<f32>()) as u64,
+            bytemuck::cast_slice(&samples[start..]),
+        );
     }
 }
 
@@ -4996,3 +5016,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_performance_tests.rs"]
+mod gpu_performance_tests;

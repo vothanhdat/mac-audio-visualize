@@ -154,13 +154,41 @@ can add up to three visual frames of FFT response delay.
 - GPU display composition handles bar gravity, peak momentum/hold, and rise
   highlights every visual frame. One instanced draw per layer renders up to
   2,048 bars without CPU-built meshes.
+- Static frequency-grid calculations are cached in a full-precision, one-row
+  GPU texture and refreshed when settings or window size change. Per-frame grid
+  rendering reads that row instead of repeating logarithms and note mapping at
+  every pixel. The cache uses four bytes per window pixel of width, rather than
+  a full-window history texture. Resolution, bar count, effects, and frame cadence
+  remain unchanged. Final 8-bit pixel rounding can differ by one channel step.
+- Streaming audio uploads include only the suffix consumed by the analyzer.
+  At 48 kHz and 60 updates/second that is typically 800 samples, rather than
+  copying all 16,384 samples each frame. Resets upload the full required warm-up
+  window, and no-sample updates skip the upload. Analyzer math is unchanged.
 - The default frequency range is 16 Hz–22.5 kHz, capped below input Nyquist.
   The smooth floor curve defaults to -51 dB at the low end and -62 dB at the
   high end. Fixed-width bars support a configurable frequency focus lens;
   musical-note layout gives each semitone equal width.
 - Mailbox VSync (FIFO fallback) follows the active display's refresh rate. GPU
-  work is briefly deferred during live window movement and resize.
+  work is briefly deferred during live window movement and resize. Axis-label
+  layout runs only within the ten-pixel-high text strip; overlay draws are
+  scissored to that strip.
 
 Run CPU and shader-validation checks with `cargo test --offline`. The additional
 Metal resource check can be run on a Mac with
 `cargo test --offline gpu_analyzers_validate_with_lazy_buffers -- --ignored`.
+
+The static-grid regression compares the original and cached shader across 96
+configurations, including 1080p, stereo, labels, transparency, focus, and resize.
+It allows at most one 8-bit rounding step per channel and reports isolated grid
+draw completion times (CPU submission plus GPU completion, excluding analysis,
+bars, and cache refresh):
+`cargo test --offline gpu_cached_grid -- --ignored --nocapture`.
+
+To compare 1 px and 10 px bars with the saved default hybrid/flat profile, run
+`cargo test --offline gpu_bar_width_cost_breakdown -- --ignored --nocapture`.
+This read-only diagnostic reports bin counts and separate completed-batch times
+for GPU analysis and bar drawing, including CPU encoding overhead. It uses
+synthetic audio and equal-height bars and excludes grid, labels, note ribbon,
+CPU FFT, and presentation. Ten times fewer bins does not mean ten times less
+total GPU time: dispatch costs and most pixel coverage remain, and bin processing
+runs in parallel. Fixed-width layouts also have a minimum of 32 bins per channel.

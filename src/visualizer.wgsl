@@ -494,8 +494,31 @@ fn reflection_alpha(progress: f32, instance: u32) -> f32 {
     return (1.0 - initial_fade) * attenuation;
 }
 
+// Per-bin light is constant across a flat bar. Evaluate it per vertex;
+// interpolate only coordinates and reflection along the bar's height.
+struct FlatBarOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) light: vec3<f32>,
+    @location(2) reflection_alpha: f32,
+}
+
+fn flat_bar_light(bin_t: f32, energy: f32, response: f32) -> vec3<f32> {
+    let low = vec3(0.08, 0.40, 1.0);
+    let middle = vec3(0.02, 0.95, 0.78);
+    let high = vec3(1.0, 0.20, 0.58);
+    let frequency_color = mix(mix(low, middle, min(bin_t * 2.0, 1.0)), high, max(bin_t * 2.0 - 1.0, 0.0));
+    let white_hot = smoothstep(0.70, 1.0, energy) * 0.88;
+    let onset = response * params.frequency_range.w;
+    let transient_white = clamp(onset * 0.10, 0.0, 0.12);
+    let luminous_color = mix(frequency_color, vec3(1.0), max(white_hot, transient_white));
+    let energy_glow = mix(params.visual.x, params.visual.y, energy * energy);
+    let transient_glow = 1.0 + onset * 1.35;
+    return luminous_color * energy_glow * transient_glow;
+}
+
 @vertex
-fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> BarOut {
+fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> FlatBarOut {
     let corners = array<vec2<f32>, 6>(
         vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
@@ -510,14 +533,11 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let displayed = detailed;
     let y_px = bar_y(corner.y, displayed, instance);
 
-    var out: BarOut;
+    var out: FlatBarOut;
     out.position = vec4(x_px / params.resolution.x * 2.0 - 1.0, 1.0 - y_px / params.resolution.y * 2.0, 0.0, 1.0);
     out.uv = corner;
-    out.energy = detailed;
-    out.bin_t = f32(bin) / f32(params.bin_count - 1u);
-    out.response = response;
+    out.light = flat_bar_light(f32(bin) / f32(params.bin_count - 1u), detailed, response);
     out.reflection_alpha = reflection_alpha(corner.y, instance);
-    out.transient = response;
     return out;
 }
 
@@ -557,8 +577,14 @@ fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
 }
 
 @fragment
-fn fs_main(in: BarOut) -> @location(0) vec4<f32> {
-    return shaded_bar(in, 0.0);
+fn fs_main(in: FlatBarOut) -> @location(0) vec4<f32> {
+    let vertical_glow = 0.58 + 0.42 * in.uv.y;
+    var top_fade = 1.0;
+    if (params.db_scale.w > 0.0001) {
+        top_fade = 1.0 - smoothstep(1.0 - params.db_scale.w, 1.0, in.uv.y);
+    }
+    return vec4(in.light * vertical_glow * in.reflection_alpha,
+        0.92 * top_fade * in.reflection_alpha);
 }
 
 @vertex
@@ -661,15 +687,20 @@ fn glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     );
     let corner = corners[vertex];
     let bin = spectrum_bin(instance);
+    let energy = spectrum[bin].x;
+    var out: BarOut;
+    if (energy <= 0.45) {
+        // The original fragment's smoothstep is exactly zero here.
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
     let pitch = channel_pitch();
     let core_width = max(pitch - params.frequency_range.z, 0.5);
     let width = core_width + 7.0;
     let shift = prism_shift(bin);
     let x_px = bar_center_x(bin) - width * 0.5 + corner.x * width + shift.x;
-    let energy = spectrum[bin].x;
     let y_px = bar_y(corner.y, energy, instance) + shift.y;
 
-    var out: BarOut;
     out.position = vec4(x_px / params.resolution.x * 2.0 - 1.0, 1.0 - y_px / params.resolution.y * 2.0, 0.0, 1.0);
     out.uv = corner;
     out.energy = energy;
@@ -805,6 +836,12 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     let core_width = max(pitch - params.frequency_range.z, 0.5);
     let response = auxiliary[HIGHLIGHT_OFFSET + bin].z;
     let onset = response * params.frequency_range.w;
+    var out: BarOut;
+    if (onset == 0.0) {
+        // Zero-strength additive light cannot change any destination pixel.
+        out.position = vec4(2.0, 2.0, 0.0, 1.0);
+        return out;
+    }
     let width = core_width + 8.0 + onset * 16.0;
     let height = 6.0 + onset * 10.0;
     let shift = prism_shift(bin);
@@ -813,7 +850,6 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     let center_y = peak_center_y(peak, instance);
     let y_px = center_y + (corner.y - 0.5) * height + shift.y;
 
-    var out: BarOut;
     out.position = vec4(x_px / params.resolution.x * 2.0 - 1.0, 1.0 - y_px / params.resolution.y * 2.0, 0.0, 1.0);
     out.uv = corner;
     out.energy = peak;

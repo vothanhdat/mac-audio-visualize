@@ -19,6 +19,10 @@ use crate::{
     resonator_resampler::ResonatorResampler,
 };
 
+#[path = "note_ribbon.rs"]
+mod note_ribbon;
+use note_ribbon::NoteRibbon;
+
 #[path = "static_grid.rs"]
 mod static_grid;
 use static_grid::StaticGrid;
@@ -193,6 +197,11 @@ struct VisualizerSettings {
     axis_labels_overlay: bool,
     axis_label_mode: AxisLabelMode,
     show_frequency_grid: bool,
+    show_note_ribbon: bool,
+    note_ribbon_width_percent: f32,
+    note_midrange_only: bool,
+    note_fast_response: bool,
+    note_smoothing_ms: f32,
     bottom_mirror: bool,
     mirror_baseline_percent: f32,
     mirror_initial_fade_percent: f32,
@@ -489,6 +498,11 @@ impl Default for VisualizerSettings {
             axis_labels_overlay: false,
             axis_label_mode: AxisLabelMode::Hertz,
             show_frequency_grid: true,
+            show_note_ribbon: true,
+            note_ribbon_width_percent: 76.0,
+            note_midrange_only: true,
+            note_fast_response: true,
+            note_smoothing_ms: 0.0,
             bottom_mirror: true,
             mirror_baseline_percent: 82.0,
             mirror_initial_fade_percent: 43.0,
@@ -585,6 +599,18 @@ impl VisualizerSettings {
         );
         self.bar_width_px = finite_clamp(self.bar_width_px, defaults.bar_width_px, 1.0, 16.0);
         self.bar_spacing_px = finite_clamp(self.bar_spacing_px, defaults.bar_spacing_px, 0.0, 12.0);
+        self.note_ribbon_width_percent = finite_clamp(
+            self.note_ribbon_width_percent,
+            defaults.note_ribbon_width_percent,
+            20.0,
+            100.0,
+        );
+        self.note_smoothing_ms = finite_clamp(
+            self.note_smoothing_ms,
+            defaults.note_smoothing_ms,
+            0.0,
+            250.0,
+        );
         self.mirror_baseline_percent = finite_clamp(
             self.mirror_baseline_percent,
             defaults.mirror_baseline_percent,
@@ -1670,6 +1696,26 @@ fn draw_settings_panel(
                 ui.small("The floor changes smoothly across the logarithmic frequency range.");
                 ui.separator();
                 ui.label("Frequency axis");
+                ui.checkbox(&mut settings.show_note_ribbon, "Show note activity at top");
+                if settings.show_note_ribbon {
+                    ui.checkbox(&mut settings.note_fast_response, "Fast note response");
+                    ui.small("Uses short audio windows for quick note changes; close low notes may be less precise.");
+                    ui.add(
+                        egui::Slider::new(&mut settings.note_smoothing_ms, 0.0..=250.0)
+                            .step_by(1.0)
+                            .suffix(" ms")
+                            .text("Note smoothing"),
+                    );
+                    ui.small("0 ms keeps the snappy look. Higher values soften glow and label transitions.");
+                    ui.checkbox(&mut settings.note_midrange_only, "Midrange notes only (200 Hz–2 kHz)");
+                    ui.add(
+                        egui::Slider::new(&mut settings.note_ribbon_width_percent, 20.0..=100.0)
+                            .step_by(1.0)
+                            .suffix("%")
+                            .text("Note ribbon width"),
+                    );
+                }
+                ui.small("C–B combines octaves and channels; the strongest note glows brighter. Harmonics also contribute.");
                 egui::ComboBox::from_label("Labels")
                     .selected_text(settings.axis_label_mode.label())
                     .show_ui(ui, |ui| {
@@ -2041,6 +2087,7 @@ pub struct GpuState {
     compose_display_pipeline: wgpu::ComputePipeline,
     static_grid: StaticGrid,
     axis_overlay_pipeline: Option<wgpu::RenderPipeline>,
+    note_ribbon: Option<NoteRibbon>,
     glow_pipeline: wgpu::RenderPipeline,
     render_pipeline: wgpu::RenderPipeline,
     prism_pipeline: Option<wgpu::RenderPipeline>,
@@ -2593,6 +2640,7 @@ impl GpuState {
             compose_display_pipeline,
             static_grid,
             axis_overlay_pipeline: None,
+            note_ribbon: None,
             glow_pipeline,
             render_pipeline,
             prism_pipeline: None,
@@ -2719,8 +2767,12 @@ impl GpuState {
         let count = self.settings.channel_mode.channel_count();
         if self.resource_mode != resource_mode {
             self.analyzers.clear();
+            self.note_ribbon = None;
             self.resource_mode = resource_mode;
             self.resonator_needs_reset = true;
+        }
+        if self.analyzers.len() != count {
+            self.note_ribbon = None;
         }
         self.analyzers.truncate(count);
         while self.analyzers.len() < count {
@@ -2744,6 +2796,30 @@ impl GpuState {
                 &self.settings,
             ));
             self.resonator_needs_reset = true;
+        }
+        if self.settings.show_note_ribbon {
+            if self.note_ribbon.is_none() {
+                self.note_ribbon = Some(NoteRibbon::new(
+                    &self.device,
+                    &self.queue,
+                    self.config.format,
+                    &self.analyzers[0].params_buffer,
+                    &self.analyzers[0].spectrum_buffer,
+                    &self.analyzers[count - 1].spectrum_buffer,
+                ));
+            }
+            self.note_ribbon.as_mut().unwrap().configure(
+                &self.queue,
+                self.settings.note_ribbon_width_percent,
+                self.settings.note_midrange_only,
+                self.settings.note_fast_response,
+            );
+            self.note_ribbon.as_mut().unwrap().set_smoothing(
+                &self.queue,
+                self.settings.note_smoothing_ms,
+            );
+        } else {
+            self.note_ribbon = None;
         }
         if matches!(
             self.settings.analysis_method,
@@ -3040,6 +3116,17 @@ impl GpuState {
         let method_changed = self.settings.analysis_method != self.last_analysis_method;
         let channel_mode_changed = self.settings.channel_mode != self.last_channel_mode;
         let delay_changed = delay_samples != self.last_delay_samples;
+        if let Some(ribbon) = &mut self.note_ribbon {
+            ribbon.update_audio(
+                &self.queue,
+                [&self.analyzers[0].samples, &self.analyzers[active_channel_count - 1].samples],
+                drained_sample_count,
+                self.sample_rate,
+                self.settings.gain,
+                [self.settings.min_frequency_hz, self.settings.max_frequency_hz],
+                delay_changed || channel_mode_changed,
+            );
+        }
         let fft_config = multirate_config(&self.settings);
         let multirate_fft_needs_reset = self.settings.analysis_method.is_multirate_fft()
             && (self.analyzers[..active_channel_count]
@@ -3500,6 +3587,9 @@ impl GpuState {
                 self.resonator_needs_reset = false;
             }
         }
+        if let Some(ribbon) = &self.note_ribbon {
+            ribbon.analyze(&mut encoder);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spectrum visualization"),
@@ -3556,6 +3646,15 @@ impl GpuState {
                 );
                 pass.set_bind_group(0, &self.analyzers[0].render_bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            if !use_visual_target {
+                if let Some(ribbon) = &self.note_ribbon {
+                    // The flat opaque view needs no composition afterwards.
+                    // Draw its final overlay here to avoid another attachment
+                    // store/load and render pass. Axis labels leave a scissor.
+                    pass.set_scissor_rect(0, 0, self.size.width, self.size.height);
+                    ribbon.draw(&mut pass);
+                }
             }
         }
         if peak_trail_enabled {
@@ -3689,6 +3788,11 @@ impl GpuState {
             pass.set_pipeline(self.composite_pipeline.as_ref().expect("active pipeline"));
             pass.set_bind_group(0, &self.composite_bind_groups[peak_trail_input_index], &[]);
             pass.draw(0..3, 0..1);
+        }
+        if use_visual_target {
+            if let Some(ribbon) = &self.note_ribbon {
+                ribbon.render(&mut encoder, &view);
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
@@ -5004,6 +5108,8 @@ mod tests {
             ("visualizer.wgsl", include_str!("visualizer.wgsl")),
             ("composite.wgsl", include_str!("composite.wgsl")),
             ("peak_feedback.wgsl", include_str!("peak_feedback.wgsl")),
+            ("note_activity.wgsl", include_str!("note_activity.wgsl")),
+            ("note_ribbon.wgsl", include_str!("note_ribbon.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name} failed to parse: {error}"));

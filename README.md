@@ -121,6 +121,39 @@ two-stage resonators, and transient assistance have been removed. Old DFT
 profiles migrate to the resonator bank; obsolete fields are ignored when loading
 and omitted on the next settings save. Other saved settings are retained.
 
+The **UI → Show note activity at top** toggle displays a C–B ribbon above the
+spectrum (enabled by default). **Note ribbon width** adjusts its centered span
+from 20% to 100% of the window width; the default is 76%, and the choice is saved.
+Its twelve labels sit on a continuous color gradient; note energy controls
+their glow, and the dominant note grows brighter
+and slightly larger. Matching notes across C1–B7 and the selected audio channels
+contribute to one shared ribbon. **Midrange notes only (200 Hz–2 kHz)** is enabled
+by default and restricts the ribbon's input without changing the spectrum.
+Turn it off to include C1–B7 within the selected analyzer range.
+**Fast note response** is enabled by default for quick arpeggios and dance music.
+It measures spectral peaks directly from short audio windows (2,048 samples at
+48 kHz, about 43 ms), independently of the spectrum's resonator Q, envelope,
+display layout, and FFT update divisor. Peaks are interpolated between FFT bins
+and folded into pitch classes. The current window chooses the winner, with a
+1% lead margin, an immediate highlight, and a 12 ms glow fade time constant.
+Short windows trade some accuracy for closely spaced low notes for response
+speed. The audio output synchronization still applies.
+
+**Note smoothing** adjusts the glow and label transitions from 0 to 250 ms
+(a smoothing time constant). The default, 0 ms, preserves the snappy response;
+30–60 ms adds a light crossfade, while larger values give a gentler look.
+It changes the visible brightness and label size without adding memory to the
+fast detector's winner selection. Changes apply immediately and are saved.
+
+With **Fast note response** off, the ribbon reads the current spectrum, using
+an 8 ms attack and 80 ms release, a 20 ms highlight attack and 60 ms fade, and a
+5% lead margin. These are smoothing time constants. Activity dims during silence. This
+shows measured pitch-class energy, including harmonics, rather than identifying
+a song's key or separating melody from accompaniment. It follows the current
+frequency range, analyzer resolution, and output synchronization. The overlay
+also works with 3D and transparent backgrounds; disabling it releases its GPU
+resources.
+
 **FFT update rate** offers **1×, ½×, ⅓×, or ¼× display** in hybrid and standalone
 FFT modes. At 60 visual frames per second these produce approximately 60, 30,
 20, or 15 FFT updates per second. Audio continues accumulating between updates,
@@ -164,6 +197,13 @@ can add up to three visual frames of FFT response delay.
   At 48 kHz and 60 updates/second that is typically 800 samples, rather than
   copying all 16,384 samples each frame. Resets upload the full required warm-up
   window, and no-sample updates skip the upload. Analyzer math is unchanged.
+- Flat bar lighting is calculated per vertex instead of repeating the same
+  color and brightness calculations at every pixel. Body glows below their
+  existing brightness threshold and peak glows with exactly zero strength are
+  clipped before rasterization. Visible glow arithmetic remains unchanged.
+- The note ribbon fetches its font atlas only inside each label's bounds. In
+  flat opaque mode it shares the spectrum's render pass, avoiding another
+  attachment store/load. Transparent and 3D modes keep the final overlay pass.
 - The default frequency range is 16 Hz–22.5 kHz, capped below input Nyquist.
   The smooth floor curve defaults to -51 dB at the low end and -62 dB at the
   high end. Fixed-width bars support a configurable frequency focus lens;
@@ -176,6 +216,12 @@ can add up to three visual frames of FFT response delay.
 Run CPU and shader-validation checks with `cargo test --offline`. The additional
 Metal resource check can be run on a Mac with
 `cargo test --offline gpu_analyzers_validate_with_lazy_buffers -- --ignored`.
+
+The note overlay has a separate Metal check for octave folding, stereo input,
+frequency focus, note layout, silence, fast audio input, and opaque/transparent rendering:
+`cargo test --offline gpu_note_activity_tracks_octaves_stereo_release_and_renders -- --ignored`.
+CPU tests also check actual synthesized PCM across common sample rates and
+180 BPM sixteenth-note sequences, including quieter notes after louder ones.
 
 The static-grid regression compares the original and cached shader across 96
 configurations, including 1080p, stereo, labels, transparency, focus, and resize.
@@ -192,3 +238,12 @@ synthetic audio and equal-height bars and excludes grid, labels, note ribbon,
 CPU FFT, and presentation. Ten times fewer bins does not mean ten times less
 total GPU time: dispatch costs and most pixel coverage remain, and bin processing
 runs in parallel. Fixed-width layouts also have a minimum of 32 bins per channel.
+
+Bar-render optimization has 144 original-versus-optimized pixel comparisons
+covering 1/3/10 px widths, mono/stereo, mirrors, fades, silence, and highlights:
+`cargo test --offline gpu_bar_render_optimization -- --ignored --nocapture`.
+The note ribbon has another 144 comparisons for its atlas sampling and merged
+pass: `cargo test --offline gpu_note_ribbon_render_optimization -- --ignored --nocapture`.
+Both checks allow at most one 8-bit rounding step per channel; the ribbon
+comparisons currently match exactly. Resolution, frame rate, and effects are
+unchanged. Timings report isolated completed batches, not whole-app GPU usage.

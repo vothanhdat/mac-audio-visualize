@@ -348,6 +348,7 @@ API_AVAILABLE(macos(14.2))
 // keeps a single producer, and the new rate is published in between.
 - (void)rebuild {
     AudioObjectID previousOutput = _output;
+    Float64 previousOutputRate = _outputRate;
     Float64 previousRate = _io ? _tapRate : 0;
     [self stopCapture];
     const char *stage = "restart system audio capture";
@@ -361,8 +362,10 @@ API_AVAILABLE(macos(14.2))
         _failing = YES;
         return;
     }
-    if (_failing || _output != previousOutput || _tapRate != previousRate) {
-        fprintf(stderr, "system audio output changed; capturing at %.0f Hz\n", _tapRate);
+    if (_failing || _output != previousOutput || _outputRate != previousOutputRate ||
+        _tapRate != previousRate) {
+        fprintf(stderr, "system audio output changed (output device at %.0f Hz); "
+                "capturing at %.0f Hz\n", _outputRate, _tapRate);
     }
     _failing = NO;
 }

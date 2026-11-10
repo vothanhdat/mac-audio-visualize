@@ -183,6 +183,19 @@ impl Model {
         }
     }
 
+    /// Follow a capture rate change (a new output device or format): the
+    /// history restarts and the reference range stays below Nyquist.
+    fn set_sample_rate(&mut self, sample_rate: u32) {
+        if sample_rate == 0 || sample_rate == self.sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        self.history = WaveformHistory::new(sample_rate);
+        let limit = (sample_rate as f64 * 0.45).min(20_000.0).max(1.0);
+        self.max_hz = self.max_hz.min(limit);
+        self.min_hz = self.min_hz.min(self.max_hz);
+    }
+
     fn ui(&mut self, context: &egui::Context) {
         let previous_channel = self.right_channel;
         let max_hz = (self.sample_rate as f64 * 0.45).min(20_000.0).max(1.0);
@@ -366,6 +379,9 @@ impl App {
     fn ingest(&mut self) {
         if let Some(audio) = &mut self.audio {
             self.model.latency_ms = audio.output_latency_ms();
+            if let Some(sample_rate) = audio.ring.take_sample_rate_change() {
+                self.model.set_sample_rate(sample_rate);
+            }
             let count = audio.ring.drain_latest(&mut self.left, &mut self.right);
             let samples = if self.model.right_channel {
                 &self.right
@@ -556,7 +572,7 @@ fn main() -> Result<()> {
             None => AudioInput::system()?,
         })
     };
-    let sample_rate = audio.as_ref().map_or(48_000, |audio| audio.sample_rate);
+    let sample_rate = audio.as_ref().map_or(48_000, AudioInput::sample_rate);
     let mut model = Model::new(sample_rate, demo);
     model.demo_beats = demo_beats;
     model.demo_hz = demo_hz;

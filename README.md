@@ -79,10 +79,18 @@ Float32 stereo without allocating or locking. The native bridge is Objective-C;
 the analyzer and UI remain Rust. Building requires Xcode Command Line Tools with
 a macOS 14.2+ SDK.
 
-Capture reads the tap's actual sample rate at startup. Restart VisualAudio after
-changing output devices or sample rates if capture stops or the spectrum becomes
-miscalibrated; automatic tap rebuilding is not implemented. Protected audio may
-be unavailable to system capture.
+Capture follows output changes without a restart. When the default output
+device, its sample rate, or the tap's format changes, the tap and its aggregate
+are rebuilt once the change settles (about 200 ms); a once-per-second check
+catches missed notifications and retries a failed rebuild. Capture pauses for a
+few milliseconds during a rebuild. The tap's rate is read again each time, and
+need not match the output device (one Mac's tap delivered 48 kHz while every
+output ran at 44.1 kHz). If the rate changed, the history, analyzers and note
+overlay restart at the new rate so frequencies stay calibrated: bars drop and
+refill. If capture delivers nothing for more than 250 ms mid-sound, for example
+while it restarts or when a player pauses as Bluetooth headphones disconnect,
+the missing time (up to 10 s) counts as silence, so bars decay instead of
+freezing. Protected audio may be unavailable to system capture.
 
 Bluetooth playback can reach your ears later than the captured samples. Native
 system capture now enables **Auto sync to audio output** by default, delaying
@@ -301,6 +309,12 @@ frequency focus, note layout, silence, fast audio input, and opaque/transparent 
 `cargo test --offline gpu_note_activity_tracks_octaves_stereo_release_and_renders -- --ignored`.
 CPU tests also check actual synthesized PCM across common sample rates and
 180 BPM sixteenth-note sequences, including quieter notes after louder ones.
+
+The tap rebuild that output changes trigger can be checked against real system
+capture, without playing sound or changing any setting. It closes capture
+during pending and running rebuilds, and, if an app is playing audio, checks
+that samples keep arriving after each rebuild:
+`VISUAL_AUDIO_CAPTURE_TEST=1 cargo test --offline --lib system_capture_keeps_delivering_across_rebuilds -- --ignored --nocapture`.
 
 The static-grid regression compares the original and cached shader across 96
 configurations, including 1080p, stereo, labels, transparency, focus, and resize.

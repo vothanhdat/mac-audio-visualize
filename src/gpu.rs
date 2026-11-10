@@ -17,7 +17,7 @@ use crate::{
     multirate_fft::{MultirateConfig, MultirateFft},
     resonator_resampler::ResonatorResampler,
 };
-use visual_audio::audio::SampleRing;
+use visual_audio::audio::{CAPTURE_STALL, CaptureStall, SampleRing};
 
 #[path = "note_ribbon.rs"]
 mod note_ribbon;
@@ -1021,12 +1021,10 @@ fn visual_delay_ms(settings: &VisualizerSettings, output_latency_ms: Option<f32>
     (automatic + settings.visualization_delay_ms).clamp(0.0, 1000.0)
 }
 
-/// System capture delivers no samples while no app plays audio, but frames can
-/// also fall between audio callbacks; only a longer gap counts as silence.
-const CAPTURE_STOPPED_AFTER: Duration = Duration::from_millis(250);
-
 /// How long the newest captured audio has been silent, and how many frames
-/// have been drawn since.
+/// have been drawn since. A gap with no samples counts as silence once it
+/// outlasts `CAPTURE_STALL` (the same point where silence is appended);
+/// shorter gaps fall between audio callbacks and keep the current state.
 #[derive(Debug)]
 struct SilenceTracker {
     since: Option<Instant>,
@@ -1050,7 +1048,7 @@ impl SilenceTracker {
                 self.last_audio = now;
                 peak < threshold
             }
-            None if now.duration_since(self.last_audio) >= CAPTURE_STOPPED_AFTER => true,
+            None if now.duration_since(self.last_audio) >= CAPTURE_STALL => true,
             None => return,
         };
         if !silent {
@@ -2247,11 +2245,14 @@ pub struct GpuState {
     analyzers: Vec<AnalyzerChannel>,
     compute_bind_group_layout: wgpu::BindGroupLayout,
     render_bind_group_layout: wgpu::BindGroupLayout,
-    resource_mode: (AnalysisMethod, bool, bool, usize, usize),
+    resource_mode: ResourceMode,
     target_features: (bool, bool, bool),
     left_history: Vec<f32>,
     right_history: Vec<f32>,
+    // Follows capture: an output device or format change restarts the
+    // history, and `resource_mode` then rebuilds the analyzers.
     sample_rate: f32,
+    capture_stall: CaptureStall,
     started: Instant,
     output_latency_ms: Option<f32>,
     last_frame: Instant,
@@ -2393,7 +2394,7 @@ impl GpuState {
         };
         controls_surface.configure(&device, &controls_config);
 
-        let history_sample_count = HISTORY_SAMPLE_COUNT.max(SAMPLE_COUNT + sample_rate as usize);
+        let history_sample_count = history_sample_count(sample_rate);
         let settings_path =
             settings_path(profile).context("could not find the macOS home directory")?;
         let settings = VisualizerSettings::load(&settings_path);
@@ -2805,17 +2806,12 @@ impl GpuState {
             analyzers,
             compute_bind_group_layout,
             render_bind_group_layout,
-            resource_mode: (
-                settings.analysis_method,
-                settings.resonator_multirate,
-                settings.resonator_five_stage,
-                fft_magnitude_count(&settings),
-                quarter_energy_stride(&settings, sample_rate as f32),
-            ),
+            resource_mode: resource_mode(&settings, sample_rate as f32),
             target_features: visual_target_features(&settings),
             left_history: vec![0.0; history_sample_count],
             right_history: vec![0.0; history_sample_count],
             sample_rate: sample_rate as f32,
+            capture_stall: CaptureStall::new(Instant::now()),
             output_latency_ms: None,
             started: Instant::now(),
             last_frame: Instant::now(),
@@ -2895,13 +2891,7 @@ impl GpuState {
     }
 
     fn prepare_resources(&mut self) {
-        let resource_mode = (
-            self.settings.analysis_method,
-            self.settings.resonator_multirate,
-            self.settings.resonator_five_stage,
-            fft_magnitude_count(&self.settings),
-            quarter_energy_stride(&self.settings, self.sample_rate),
-        );
+        let resource_mode = resource_mode(&self.settings, self.sample_rate);
         let count = self.settings.channel_mode.channel_count();
         if self.resource_mode != resource_mode {
             self.analyzers.clear();
@@ -3134,11 +3124,13 @@ impl GpuState {
     }
 
     /// Drain audio while no frames are drawn (hidden window or idle mode) so the
-    /// capture ring cannot fill. The samples join the shared history, so the
-    /// next frame analyzes current audio; silence tracking continues.
+    /// capture ring cannot fill. The samples join the shared history at the
+    /// current capture rate, with silence for a capture stall, so the next
+    /// frame analyzes current audio; silence tracking continues.
     pub fn drain_undrawn_audio(&mut self, ring: &SampleRing) {
         self.save_settings_if_due();
-        let drained = ring.drain_latest(&mut self.left_history, &mut self.right_history);
+        self.follow_sample_rate(ring);
+        let drained = self.drain_audio(ring);
         if drained > 0 {
             self.audio_gap = true;
         }
@@ -3171,6 +3163,45 @@ impl GpuState {
         });
         self.silence
             .observe(peak, silence_threshold(&self.settings), Instant::now());
+    }
+
+    /// Follow a capture sample-rate change (a new output device or format).
+    /// The history restarts empty at the new rate; analyzers, the note ribbon
+    /// and every rate-derived setting are rebuilt by `prepare_resources`,
+    /// because the rate is part of `resource_mode`.
+    fn follow_sample_rate(&mut self, ring: &SampleRing) {
+        let Some(sample_rate) = ring.take_sample_rate_change() else {
+            return;
+        };
+        // Queued samples from the previous rate were discarded.
+        self.audio_gap = true;
+        if sample_rate == 0 || sample_rate as f32 == self.sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate as f32;
+        let count = history_sample_count(sample_rate);
+        self.left_history = vec![0.0; count];
+        self.right_history = vec![0.0; count];
+        self.capture_stall = CaptureStall::new(Instant::now());
+        // The frequency layout depends on the rate (its Nyquist cap), so an
+        // idle display draws again until it settles at the new rate.
+        self.note_activity();
+    }
+
+    /// Append newly captured samples to the history and return how many are
+    /// new. A capture stall adds silence, so levels decay instead of freezing.
+    fn drain_audio(&mut self, ring: &SampleRing) -> usize {
+        let drained = ring.drain_latest(&mut self.left_history, &mut self.right_history);
+        let history_len = self.left_history.len();
+        let already_silent = self.capture_stall.filled() >= history_len as u64;
+        let silent =
+            self.capture_stall
+                .silent_samples(drained, Instant::now(), self.sample_rate);
+        if silent > 0 && !already_silent {
+            append_silence(&mut self.left_history, silent);
+            append_silence(&mut self.right_history, silent);
+        }
+        (drained + silent).min(history_len)
     }
 
     pub fn adjust_gain(&mut self, multiplier: f32) {
@@ -3219,6 +3250,7 @@ impl GpuState {
         output_latency_ms: Option<f32>,
     ) -> Result<(), wgpu::SurfaceError> {
         self.output_latency_ms = output_latency_ms;
+        self.follow_sample_rate(ring);
         self.save_settings_if_due();
         self.apply_pending_resize();
         self.apply_surface_history_size();
@@ -3233,8 +3265,7 @@ impl GpuState {
         let now = Instant::now();
         let frame_delta = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
-        let drained_sample_count =
-            ring.drain_latest(&mut self.left_history, &mut self.right_history);
+        let drained_sample_count = self.drain_audio(ring);
         self.observe_audio(drained_sample_count);
         self.silence.count_frame();
         let active_channel_count = self.settings.channel_mode.channel_count();
@@ -4526,6 +4557,34 @@ fn quarter_energy_stride(settings: &VisualizerSettings, sample_rate: f32) -> usi
     (sample_rate / (4.0 * frequency * divisor)).ceil() as usize + 2
 }
 
+/// Everything the analyzer buffers are sized from; a change rebuilds them.
+type ResourceMode = (AnalysisMethod, bool, bool, usize, usize, u32);
+
+fn resource_mode(settings: &VisualizerSettings, sample_rate: f32) -> ResourceMode {
+    (
+        settings.analysis_method,
+        settings.resonator_multirate,
+        settings.resonator_five_stage,
+        fft_magnitude_count(settings),
+        quarter_energy_stride(settings, sample_rate),
+        sample_rate as u32,
+    )
+}
+
+/// Shared capture history: at least one second beyond the analyzer block, so
+/// the output delay (up to one second) always has samples behind it.
+fn history_sample_count(sample_rate: u32) -> usize {
+    HISTORY_SAMPLE_COUNT.max(SAMPLE_COUNT + sample_rate as usize)
+}
+
+/// Shift `count` zero samples into the end of a history.
+fn append_silence(history: &mut [f32], count: usize) {
+    let count = count.min(history.len());
+    history.copy_within(count.., 0);
+    let start = history.len() - count;
+    history[start..].fill(0.0);
+}
+
 fn fft_magnitude_count(settings: &VisualizerSettings) -> usize {
     if !settings.analysis_method.is_multirate_fft() {
         return 1;
@@ -5174,13 +5233,17 @@ mod tests {
                 "compose",
                 "compose_display",
             );
-            for method in [
-                AnalysisMethod::ResonatorBank,
-                AnalysisMethod::HybridResonatorFft,
-                AnalysisMethod::MultirateFft,
-                AnalysisMethod::MultirateFft5,
-                AnalysisMethod::AuditoryErb,
-            ] {
+            // Capture follows output changes, so analyzers are rebuilt at each rate.
+            for (sample_rate, method) in [44_100, 48_000, 96_000].into_iter().flat_map(|rate| {
+                [
+                    AnalysisMethod::ResonatorBank,
+                    AnalysisMethod::HybridResonatorFft,
+                    AnalysisMethod::MultirateFft,
+                    AnalysisMethod::MultirateFft5,
+                    AnalysisMethod::AuditoryErb,
+                ]
+                .map(|method| (rate, method))
+            }) {
                 for multirate in [false, true] {
                     for five_stage in [false, true] {
                         let settings = VisualizerSettings {
@@ -5198,7 +5261,7 @@ mod tests {
                         };
                         let params = analysis_params(
                             &settings,
-                            [48000.0, 0.0, 1.0 / 60.0],
+                            [sample_rate as f32, 0.0, 1.0 / 60.0],
                             16,
                             true,
                             ([0; 5], true),
@@ -5210,7 +5273,7 @@ mod tests {
                             &compute_layout,
                             &render_layout,
                             &params,
-                            HISTORY_SAMPLE_COUNT,
+                            history_sample_count(sample_rate),
                             0,
                             1.0,
                             &settings,
@@ -5277,6 +5340,36 @@ mod tests {
             let error = device.pop_error_scope().await;
             assert!(error.is_none(), "GPU validation failed: {error:?}");
         });
+    }
+
+    #[test]
+    fn analyzer_resources_follow_the_capture_sample_rate() {
+        let settings = VisualizerSettings::default();
+        assert_ne!(
+            resource_mode(&settings, 44_100.0),
+            resource_mode(&settings, 48_000.0)
+        );
+        assert_eq!(
+            resource_mode(&settings, 48_000.0),
+            resource_mode(&settings, 48_000.0)
+        );
+        assert_eq!(history_sample_count(44_100), HISTORY_SAMPLE_COUNT);
+        assert_eq!(history_sample_count(48_000), HISTORY_SAMPLE_COUNT);
+        for rate in [8_000, 16_000, 44_100, 48_000, 88_200, 96_000, 192_000] {
+            // The full one-second output delay stays available at every rate.
+            assert!(history_sample_count(rate) >= SAMPLE_COUNT + rate as usize);
+        }
+    }
+
+    #[test]
+    fn appended_silence_shifts_the_history() {
+        let mut history = [1.0, 2.0, 3.0, 4.0];
+        append_silence(&mut history, 1);
+        assert_eq!(history, [2.0, 3.0, 4.0, 0.0]);
+        append_silence(&mut history, 0);
+        assert_eq!(history, [2.0, 3.0, 4.0, 0.0]);
+        append_silence(&mut history, 10);
+        assert_eq!(history, [0.0; 4]);
     }
 
     #[test]

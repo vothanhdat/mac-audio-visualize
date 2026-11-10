@@ -38,6 +38,9 @@ struct App {
 // While hidden, macOS may withhold drawables; skip rendering but keep the
 // capture ring from filling so analysis resumes with current audio.
 const HIDDEN_AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+// While idle in silence, how often to check for audio. Sound that returns
+// is drawn within this interval plus one display refresh.
+const IDLE_AUDIO_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -171,6 +174,10 @@ impl ApplicationHandler for App {
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
                 if !occluded {
+                    // The last frame shown may predate the hidden period.
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.note_activity();
+                    }
                     self.next_frame = Instant::now();
                     self.window.as_ref().unwrap().request_redraw();
                 }
@@ -253,12 +260,28 @@ impl ApplicationHandler for App {
         if self.occluded {
             if now >= self.next_frame {
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.drain_hidden_audio(&self.audio.ring);
+                    gpu.drain_undrawn_audio(&self.audio.ring);
                 }
                 self.next_frame = now + HIDDEN_AUDIO_DRAIN_INTERVAL;
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
             return;
+        }
+        if self.interaction_until.is_none()
+            && let Some(gpu) = &mut self.gpu
+            && gpu.idle_ready()
+        {
+            // Silent and settled: the frame on screen is still correct. Check
+            // the newest audio without drawing, and resume as soon as it returns.
+            if now >= self.next_frame {
+                gpu.drain_undrawn_audio(&self.audio.ring);
+                self.next_frame = now + IDLE_AUDIO_POLL_INTERVAL;
+            }
+            if gpu.idle_ready() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+                return;
+            }
+            self.next_frame = now;
         }
         if let Some(deadline) = self.interaction_until {
             if now >= deadline {

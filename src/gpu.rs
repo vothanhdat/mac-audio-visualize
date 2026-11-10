@@ -1021,6 +1021,112 @@ fn visual_delay_ms(settings: &VisualizerSettings, output_latency_ms: Option<f32>
     (automatic + settings.visualization_delay_ms).clamp(0.0, 1000.0)
 }
 
+/// System capture delivers no samples while no app plays audio, but frames can
+/// also fall between audio callbacks; only a longer gap counts as silence.
+const CAPTURE_STOPPED_AFTER: Duration = Duration::from_millis(250);
+
+/// How long the newest captured audio has been silent, and how many frames
+/// have been drawn since.
+#[derive(Debug)]
+struct SilenceTracker {
+    since: Option<Instant>,
+    frames: u32,
+    last_audio: Instant,
+}
+
+impl SilenceTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: None,
+            frames: 0,
+            last_audio: now,
+        }
+    }
+
+    /// `peak` is the newest samples' absolute peak, or `None` if none arrived.
+    fn observe(&mut self, peak: Option<f32>, threshold: f32, now: Instant) {
+        let silent = match peak {
+            Some(peak) => {
+                self.last_audio = now;
+                peak < threshold
+            }
+            None if now.duration_since(self.last_audio) >= CAPTURE_STOPPED_AFTER => true,
+            None => return,
+        };
+        if !silent {
+            self.since = None;
+        } else if self.since.is_none() {
+            self.since = Some(now);
+            self.frames = 0;
+        }
+    }
+
+    fn count_frame(&mut self) {
+        if self.since.is_some() {
+            self.frames = self.frames.saturating_add(1);
+        }
+    }
+
+    fn restart(&mut self, now: Instant) {
+        if self.since.is_some() {
+            self.since = Some(now);
+            self.frames = 0;
+        }
+    }
+
+    fn settled(&self, frames: u32, seconds: f32, now: Instant) -> bool {
+        self.since.is_some_and(|since| {
+            self.frames >= frames && now.duration_since(since).as_secs_f32() >= seconds
+        })
+    }
+}
+
+/// Peak sample amplitude below which no bar can rise above the lowest dB
+/// floor. The 30 dB margin covers analyzer magnitudes above the sample peak.
+fn silence_threshold(settings: &VisualizerSettings) -> f32 {
+    let floor_db = settings.low_db_floor.min(settings.high_db_floor);
+    10f32.powf((floor_db - 30.0) / 20.0) / settings.gain.max(0.000_001)
+}
+
+/// Seconds after the newest audio falls silent until the display has settled.
+/// Includes the visual delay, because the display lags the newest samples.
+fn idle_settle_seconds(settings: &VisualizerSettings, output_latency_ms: Option<f32>) -> f32 {
+    let span_db = -settings.low_db_floor.min(settings.high_db_floor);
+    // Resonator envelopes release at a fixed dB rate; bars then fall under gravity.
+    let bars = span_db * settings.resonator_decay_seconds / settings.resonator_decay_db.max(0.001)
+        + (2.0 * span_db / settings.bar_gravity_db_per_second2.max(0.001)).sqrt();
+    // With momentum, a peak can first coast to the top, hold, then fall the span.
+    let peak_fall = (2.0 * span_db / settings.peak_gravity_db_per_second2.max(0.001)).sqrt();
+    let peaks = settings.peak_hold_ms * 0.001
+        + peak_fall * if settings.peak_momentum { 2.0 } else { 1.0 };
+    // Exponential fades are invisible after seven time constants.
+    let highlights = 7.0 * settings.rise_highlight_fade_ms * 0.001;
+    let notes = 7.0 * settings.note_smoothing_ms.max(80.0) * 0.001;
+    let trails = if settings.render_mode == RenderMode::Surface3d
+        && settings.surface_peak_trail_enabled
+    {
+        7.0 * settings.surface_peak_trail_fade_seconds
+    } else {
+        0.0
+    };
+    visual_delay_ms(settings, output_latency_ms) * 0.001
+        + (bars + peaks).max(highlights).max(notes).max(trails)
+        + 0.25
+}
+
+/// Frames that must be drawn during silence before idling: the 3D history
+/// advances one row per frame, so it needs every row to scroll through.
+fn idle_settle_frames(settings: &VisualizerSettings) -> u32 {
+    if settings.render_mode == RenderMode::Surface3d && settings.surface_history_enabled {
+        settings
+            .surface_history_rows
+            .clamp(MIN_SURFACE_HISTORY_ROWS, MAX_SURFACE_HISTORY_ROWS)
+            + 2
+    } else {
+        2
+    }
+}
+
 fn fft_cadence_control(ui: &mut egui::Ui, settings: &mut VisualizerSettings) {
     egui::ComboBox::from_label("FFT update rate")
         .selected_text(match settings.fft_display_divisor {
@@ -2170,6 +2276,9 @@ pub struct GpuState {
     // Samples were drained without analysis (hidden window); streaming
     // analyzers must restart from the contiguous history.
     audio_gap: bool,
+    // Idle mode: once the newest audio has been silent long enough for every
+    // decay to finish, the settled frame stays on screen and redraws pause.
+    silence: SilenceTracker,
     settings_path: PathBuf,
     settings: VisualizerSettings,
     settings_dirty: bool,
@@ -2745,6 +2854,7 @@ impl GpuState {
             last_peak_momentum: settings.peak_momentum,
             resonator_needs_reset: true,
             audio_gap: false,
+            silence: SilenceTracker::new(Instant::now()),
             settings_path,
             settings,
             settings_dirty: false,
@@ -2756,6 +2866,7 @@ impl GpuState {
     pub fn resize_visualizer(&mut self, size: PhysicalSize<u32>) {
         if size.width > 0 && size.height > 0 {
             self.pending_size = Some(size);
+            self.note_activity();
         }
     }
 
@@ -3022,12 +3133,44 @@ impl GpuState {
         }
     }
 
-    /// Keep the capture ring from filling while the visualizer is hidden. The
-    /// samples join the shared history, so the next frame analyzes current audio.
-    pub fn drain_hidden_audio(&mut self, ring: &SampleRing) {
-        if ring.drain_latest(&mut self.left_history, &mut self.right_history) > 0 {
+    /// Drain audio while no frames are drawn (hidden window or idle mode) so the
+    /// capture ring cannot fill. The samples join the shared history, so the
+    /// next frame analyzes current audio; silence tracking continues.
+    pub fn drain_undrawn_audio(&mut self, ring: &SampleRing) {
+        self.save_settings_if_due();
+        let drained = ring.drain_latest(&mut self.left_history, &mut self.right_history);
+        if drained > 0 {
             self.audio_gap = true;
         }
+        self.observe_audio(drained);
+    }
+
+    /// True once the newest audio has been silent long enough for every bar,
+    /// peak, glow and trail to settle, so the frame on screen stays correct.
+    pub fn idle_ready(&self) -> bool {
+        self.silence.settled(
+            idle_settle_frames(&self.settings),
+            idle_settle_seconds(&self.settings, self.output_latency_ms),
+            Instant::now(),
+        )
+    }
+
+    /// Restart the settle period after a visible change during silence (a
+    /// setting, resize or newly revealed window), so it is drawn before idling.
+    pub fn note_activity(&mut self) {
+        self.silence.restart(Instant::now());
+    }
+
+    fn observe_audio(&mut self, drained: usize) {
+        let peak = (drained > 0).then(|| {
+            let start = self.left_history.len() - drained.min(self.left_history.len());
+            self.left_history[start..]
+                .iter()
+                .chain(&self.right_history[start..])
+                .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+        });
+        self.silence
+            .observe(peak, silence_threshold(&self.settings), Instant::now());
     }
 
     pub fn adjust_gain(&mut self, multiplier: f32) {
@@ -3037,6 +3180,7 @@ impl GpuState {
     }
 
     fn mark_settings_dirty(&mut self) {
+        self.note_activity();
         self.settings_dirty = true;
         self.settings_save_deadline = Some(Instant::now() + Duration::from_millis(300));
     }
@@ -3091,6 +3235,8 @@ impl GpuState {
         self.last_frame = now;
         let drained_sample_count =
             ring.drain_latest(&mut self.left_history, &mut self.right_history);
+        self.observe_audio(drained_sample_count);
+        self.silence.count_frame();
         let active_channel_count = self.settings.channel_mode.channel_count();
         for channel_index in 0..active_channel_count {
             let analyzer = &mut self.analyzers[channel_index];
@@ -5154,6 +5300,87 @@ mod tests {
         assert_eq!(visual_delay_ms(&settings, Some(240.0)), 900.0);
         settings.auto_output_sync = true;
         assert_eq!(visual_delay_ms(&settings, None), 900.0);
+    }
+
+    #[test]
+    fn silence_threshold_keeps_quiet_audio_below_every_floor() {
+        let mut settings = VisualizerSettings::default();
+        let threshold = silence_threshold(&settings);
+        // 30 dB below the lowest floor (-62 dB) after the visual gain.
+        let threshold_db = 20.0 * (threshold * settings.gain).log10();
+        assert!((threshold_db - -92.0).abs() < 0.001, "{threshold_db}");
+        assert!(0.0 < threshold, "digital silence must count as silent");
+        assert!(0.001 > threshold, "-60 dBFS audio must keep drawing");
+        settings.gain = 20.0;
+        assert!(silence_threshold(&settings) < threshold);
+        settings.low_db_floor = -120.0;
+        let deepest_db = 20.0 * (silence_threshold(&settings) * 20.0).log10();
+        assert!((deepest_db - -150.0).abs() < 0.001, "{deepest_db}");
+    }
+
+    #[test]
+    fn idle_settle_time_covers_every_default_decay() {
+        let mut settings = VisualizerSettings::default();
+        // Peaks: 120 ms hold + momentum (rise and fall) over the 62 dB span at
+        // 45 dB/s². Bars: 62 dB at 60 dB per 0.3 s, then a 5000 dB/s² fall.
+        let peak_fall = (2.0f32 * 62.0 / 45.0).sqrt();
+        let expected = 0.12 + 2.0 * peak_fall + 62.0 * 0.3 / 60.0
+            + (2.0f32 * 62.0 / 5000.0).sqrt()
+            + 0.25;
+        let settle = idle_settle_seconds(&settings, None);
+        assert!((settle - expected).abs() < 0.001, "{settle} vs {expected}");
+        assert!((idle_settle_seconds(&settings, Some(200.0)) - settle - 0.2).abs() < 0.001);
+        settings.peak_momentum = false;
+        let without_momentum = idle_settle_seconds(&settings, None);
+        assert!((settle - without_momentum - peak_fall).abs() < 0.001);
+        settings.render_mode = RenderMode::Surface3d;
+        settings.surface_peak_trail_enabled = true;
+        settings.surface_peak_trail_fade_seconds = 5.0;
+        assert!(idle_settle_seconds(&settings, None) >= 35.0);
+    }
+
+    #[test]
+    fn silence_tracker_treats_stopped_capture_as_silence_but_not_callback_gaps() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let threshold = 0.001;
+        let mut silence = SilenceTracker::new(start);
+        silence.observe(Some(0.5), threshold, at(0));
+        // Frames between audio callbacks bring no samples while music plays.
+        silence.observe(None, threshold, at(100));
+        assert!(silence.since.is_none());
+        // Capture delivers nothing at all while no app plays audio.
+        silence.observe(None, threshold, at(250));
+        assert_eq!(silence.since, Some(at(250)));
+        // Staying silent keeps the original start; frames are counted.
+        silence.observe(Some(0.0), threshold, at(300));
+        silence.count_frame();
+        silence.count_frame();
+        assert_eq!(silence.since, Some(at(250)));
+        assert!(silence.settled(2, 1.0, at(1250)));
+        assert!(!silence.settled(3, 1.0, at(1250)), "needs enough drawn frames");
+        assert!(!silence.settled(2, 1.0, at(1249)), "needs the full settle time");
+        // A visible change restarts the settle period and the frame count.
+        silence.restart(at(2000));
+        assert_eq!((silence.since, silence.frames), (Some(at(2000)), 0));
+        // Audio at or above the threshold ends silence immediately.
+        silence.observe(Some(threshold), threshold, at(2100));
+        assert!(silence.since.is_none());
+        silence.restart(at(2200));
+        assert!(silence.since.is_none(), "restart must not start silence");
+        silence.count_frame();
+        assert_eq!(silence.frames, 0);
+    }
+
+    #[test]
+    fn idle_settle_frames_wait_for_surface_history() {
+        let mut settings = VisualizerSettings::default();
+        assert_eq!(idle_settle_frames(&settings), 2);
+        settings.render_mode = RenderMode::Surface3d;
+        assert_eq!(idle_settle_frames(&settings), 2);
+        settings.surface_history_enabled = true;
+        settings.surface_history_rows = 512;
+        assert_eq!(idle_settle_frames(&settings), 514);
     }
 
     #[test]

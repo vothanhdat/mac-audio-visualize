@@ -281,6 +281,17 @@ can add up to three visual frames of FFT response delay.
   withhold drawables for up to a second). The capture ring is still drained
   every 250 ms, and analyzers restart from the continuous history when the
   window is visible again.
+- **Idle in silence.** Once the newest audio is silent and every bar, peak,
+  glow and trail has had time to settle, redraws pause and the settled frame
+  stays on screen. Audio is still checked every 20 ms, and drawing resumes
+  as soon as it returns, with analyzers restarting from the continuous history.
+  Silence means samples 30 dB below the lowest dB floor after gain, or no
+  samples for 250 ms (system capture delivers none while no app plays). The
+  settle time follows the current decay settings and output delay: about
+  4.2 s with the defaults, longer for slow peak gravity or 3D history and
+  trails. Changing a setting, resizing, or revealing the window draws again
+  until things settle. Measured at 60 Hz: about 0.3% CPU while idle, compared
+  with about 10% while drawing.
 
 Run CPU and shader-validation checks with `cargo test --offline`. The additional
 Metal resource check can be run on a Mac with

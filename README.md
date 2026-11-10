@@ -10,6 +10,12 @@ then a GPU compositor converts RGB light intensity into a clean premultiplied
 alpha channel. It is disabled by default; the detached controls stay opaque.
 The visualizer uses a hidden, transparent macOS title bar: the traffic-light
 buttons remain available and dragging anywhere in the canvas moves the window.
+It can be as short as 60 points (320 wide) for a thin spectrum strip.
+The visualizer and controls windows reopen where you left them, at the same
+size. Their positions are saved half a second after a move or resize and when
+quitting, in `window.json` (`window-NAME.json` for `--profile NAME`) next to
+the settings. A position on a display that is no longer connected is ignored,
+so the window opens on screen. **Reset** does not move windows.
 Visualizer controls are restored on startup from
 `~/Library/Application Support/VisualAudio/settings.json`; edits are saved
 automatically after a short debounce.

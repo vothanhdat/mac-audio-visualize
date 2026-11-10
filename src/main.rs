@@ -2,8 +2,10 @@ mod gpu;
 mod hybrid_matcher;
 mod multirate_fft;
 mod resonator_resampler;
+mod window_state;
 
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,11 +13,12 @@ use std::{
 use anyhow::{Context, Result};
 use gpu::GpuState;
 use visual_audio::audio::AudioInput;
+use window_state::{Frame, WindowState};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -33,6 +36,47 @@ struct App {
     next_frame: Instant,
     interaction_until: Option<Instant>,
     occluded: bool,
+    window_state: WindowState,
+    window_state_path: Option<PathBuf>,
+    window_state_save_at: Option<Instant>,
+}
+
+// Window moves arrive continuously while dragging; save once they settle.
+const WINDOW_STATE_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+impl App {
+    fn schedule_window_state_save(&mut self) {
+        self.window_state_save_at = Some(Instant::now() + WINDOW_STATE_SAVE_DELAY);
+    }
+
+    /// Save both windows' frames once a move or resize has settled. When
+    /// exiting (`now`), save the current frames even without a reported move:
+    /// macOS reports a drag only when it ends. A frame that cannot be read
+    /// keeps its previous value, and unchanged frames are not rewritten.
+    fn save_window_state_if_due(&mut self, now: bool) {
+        let due = self
+            .window_state_save_at
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !now && !due {
+            return;
+        }
+        self.window_state_save_at = None;
+        let previous = self.window_state.clone();
+        if let Some(frame) = self.window.as_deref().and_then(Frame::of) {
+            self.window_state.visualizer = Some(frame);
+        }
+        if let Some(frame) = self.controls_window.as_deref().and_then(Frame::of) {
+            self.window_state.controls = Some(frame);
+        }
+        if self.window_state == previous && !due {
+            return;
+        }
+        if let Some(path) = &self.window_state_path
+            && let Err(error) = self.window_state.save(path)
+        {
+            eprintln!("could not save window positions: {error:#}");
+        }
+    }
 }
 
 // While hidden, macOS may withhold drawables; skip rendering but keep the
@@ -52,19 +96,33 @@ impl ApplicationHandler for App {
             .as_deref()
             .map(|profile| format!(" — {profile}"))
             .unwrap_or_default();
-        let attributes = WindowAttributes::default()
-            .with_title(format!(
-                "VisualAudio — {}{profile_suffix}",
-                self.audio.device_name
-            ))
-            .with_transparent(true)
-            .with_titlebar_transparent(true)
-            .with_title_hidden(true)
-            .with_fullsize_content_view(true)
-            .with_movable_by_window_background(true)
-            .with_has_shadow(false)
-            .with_inner_size(LogicalSize::new(320.0, 180.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 180.0));
+        // Reopen windows where they were last, unless that display is gone.
+        let screens = window_state::screens(event_loop.available_monitors());
+        let restore = |attributes: WindowAttributes, frame: Option<Frame>| match frame
+            .filter(|frame| frame.restorable(&screens))
+        {
+            Some(frame) => attributes
+                .with_position(LogicalPosition::new(frame.x, frame.y))
+                .with_inner_size(LogicalSize::new(frame.width, frame.height)),
+            None => attributes,
+        };
+        let attributes = restore(
+            WindowAttributes::default()
+                .with_title(format!(
+                    "VisualAudio — {}{profile_suffix}",
+                    self.audio.device_name
+                ))
+                .with_transparent(true)
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true)
+                .with_movable_by_window_background(true)
+                .with_has_shadow(false)
+                .with_inner_size(LogicalSize::new(320.0, 180.0))
+                // Short enough for a thin spectrum strip; the plot clamps at small heights.
+                .with_min_inner_size(LogicalSize::new(320.0, 60.0)),
+            self.window_state.visualizer,
+        );
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -79,13 +137,14 @@ impl ApplicationHandler for App {
         self.next_frame = Instant::now();
         let controls_window = Arc::new(
             event_loop
-                .create_window(
+                .create_window(restore(
                     WindowAttributes::default()
                         .with_title(format!("VisualAudio Controls{profile_suffix}"))
                         .with_inner_size(LogicalSize::new(380.0, 760.0))
                         .with_min_inner_size(LogicalSize::new(300.0, 360.0))
                         .with_visible(false),
-                )
+                    self.window_state.controls,
+                ))
                 .expect("controls window creation failed"),
         );
         let gpu = match pollster::block_on(GpuState::new(
@@ -123,6 +182,9 @@ impl ApplicationHandler for App {
             .is_some_and(|window| window.id() == window_id);
         if !is_visualizer && !is_controls {
             return;
+        }
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+            self.schedule_window_state_save();
         }
 
         if is_controls {
@@ -253,6 +315,9 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The loop wakes at least every 250 ms in every state below, so a
+        // pending save runs shortly after moves settle.
+        self.save_window_state_if_due(false);
         let Some(window) = &self.window else {
             return;
         };
@@ -298,6 +363,11 @@ impl ApplicationHandler for App {
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Quitting right after a move, or before a move was reported, must not lose it.
+        self.save_window_state_if_due(true);
+    }
 }
 
 fn main() -> Result<()> {
@@ -333,11 +403,19 @@ fn main() -> Result<()> {
         audio.sample_rate(),
         audio.channels
     );
+    let window_state_path = window_state::window_state_path(profile.as_deref());
+    let window_state = window_state_path
+        .as_deref()
+        .map(WindowState::load)
+        .unwrap_or_default();
     let event_loop = EventLoop::new().context("could not create the event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App {
         audio,
         profile,
+        window_state,
+        window_state_path,
+        window_state_save_at: None,
         window: None,
         controls_window: None,
         controls_visible: false,

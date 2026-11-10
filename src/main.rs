@@ -1,4 +1,3 @@
-mod audio;
 mod gpu;
 mod hybrid_matcher;
 mod multirate_fft;
@@ -10,8 +9,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use audio::AudioInput;
 use gpu::GpuState;
+use visual_audio::audio::AudioInput;
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::{
@@ -33,7 +32,12 @@ struct App {
     frame_interval: Duration,
     next_frame: Instant,
     interaction_until: Option<Instant>,
+    occluded: bool,
 }
+
+// While hidden, macOS may withhold drawables; skip rendering but keep the
+// capture ring from filling so analysis resumes with current audio.
+const HIDDEN_AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -164,6 +168,13 @@ impl ApplicationHandler for App {
             WindowEvent::Moved(_) => {
                 self.interaction_until = Some(Instant::now() + Duration::from_millis(60));
             }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    self.next_frame = Instant::now();
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
@@ -202,9 +213,10 @@ impl ApplicationHandler for App {
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
-                if self
-                    .interaction_until
-                    .is_some_and(|deadline| Instant::now() < deadline)
+                if self.occluded
+                    || self
+                        .interaction_until
+                        .is_some_and(|deadline| Instant::now() < deadline)
                 {
                     return;
                 }
@@ -223,7 +235,11 @@ impl ApplicationHandler for App {
                     Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
                     Err(error) => eprintln!("rendering error: {error}"),
                 }
-                self.next_frame = Instant::now() + self.frame_interval;
+                // The FIFO drawable wait at the start of the next frame aligns it
+                // with the display refresh. Requesting it after half an interval
+                // keeps that wait short without missing a refresh; the floor only
+                // prevents a busy loop if a drawable is ever returned immediately.
+                self.next_frame = Instant::now() + self.frame_interval / 2;
             }
             _ => {}
         }
@@ -234,6 +250,16 @@ impl ApplicationHandler for App {
             return;
         };
         let now = Instant::now();
+        if self.occluded {
+            if now >= self.next_frame {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.drain_hidden_audio(&self.audio.ring);
+                }
+                self.next_frame = now + HIDDEN_AUDIO_DRAIN_INTERVAL;
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+            return;
+        }
         if let Some(deadline) = self.interaction_until {
             if now >= deadline {
                 self.interaction_until = None;
@@ -257,7 +283,9 @@ fn main() -> Result<()> {
     let mut profile = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--device" => device_match = Some(args.next().context("--device needs a name fragment")?),
+            "--device" => {
+                device_match = Some(args.next().context("--device needs a name fragment")?)
+            }
             "--profile" => {
                 let value = args.next().context("--profile needs a name")?;
                 profile = Some(validate_profile_name(&value)?);
@@ -292,6 +320,7 @@ fn main() -> Result<()> {
         frame_interval: Duration::from_micros(16_667),
         next_frame: Instant::now(),
         interaction_until: None,
+        occluded: false,
     })?;
     Ok(())
 }

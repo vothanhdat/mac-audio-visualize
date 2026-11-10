@@ -27,6 +27,19 @@ struct Params {
 struct ResonatorState {
     oscillator: vec2<f32>,
     value: vec2<f32>,
+    processed_samples: f32,
+    last_sample: f32,
+    energy_cursor: u32,
+    energy_filled: u32,
+    paired_energy: f32,
+}
+
+// Keep energy history after the shared 64-byte-per-bin auxiliary reservation.
+// Display highlights occupy the unused tail of this reservation.
+struct ResonatorAuxiliary {
+    states: array<ResonatorState, 2048>, // 40-byte stride
+    reserved: array<vec4<f32>, 3072>,
+    history: array<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> samples: array<f32>;
@@ -36,7 +49,7 @@ struct ResonatorState {
 @group(0) @binding(4) var<storage, read_write> eighth_rate_samples: array<f32>;
 @group(0) @binding(5) var<storage, read_write> half_rate_samples: array<f32>;
 @group(0) @binding(6) var<storage, read_write> sixteenth_rate_samples: array<f32>;
-@group(0) @binding(8) var<storage, read_write> states: array<ResonatorState>;
+@group(0) @binding(8) var<storage, read_write> auxiliary: ResonatorAuxiliary;
 
 const PI: f32 = 3.141592653589793;
 const MAX_SAMPLE_COUNT: u32 = 16384u;
@@ -64,42 +77,101 @@ fn complex_conjugate(value: vec2<f32>) -> vec2<f32> {
     return vec2(value.x, -value.y);
 }
 
-fn complex_divide(numerator: vec2<f32>, denominator: vec2<f32>) -> vec2<f32> {
-    let scale = max(dot(denominator, denominator), 0.000001);
-    return complex_multiply(numerator, complex_conjugate(denominator)) / scale;
+// exp(-x) rounds close to one for low frequencies / high Q. Preserve the
+// small input weight instead of subtracting two nearly equal f32 values.
+fn one_minus_exp_negative(x: f32) -> f32 {
+    if (x < 0.1) {
+        return x * (1.0 - x * (0.5 - x * (1.0 / 6.0 - x * (1.0 / 24.0 - x / 120.0))));
+    }
+    return 1.0 - exp(-x);
 }
 
 fn measured_phasor(
     state: vec2<f32>,
     oscillator: vec2<f32>,
     rotation: vec2<f32>,
-    damping: f32,
+    phase: f32,
+    decay_exponent: f32,
+    input_weight: f32,
+    processed_samples: f32,
 ) -> vec2<f32> {
     if (params.resonator.z < 0.5) {
         return state;
     }
 
-    // A real sinusoid mixed down by the complex oscillator contains the wanted
-    // stationary phasor plus a counter-rotating image at twice the tuned
-    // frequency. Reconstruct that image through the resonator's exact one-pole
-    // response, then solve z = wanted + image * conjugate(wanted). This removes
-    // phase-dependent level ripple without another time window.
-    let positive_double_rotation = complex_multiply(
-        complex_conjugate(rotation),
-        complex_conjugate(rotation),
-    );
-    var image_response = complex_divide(
-        vec2(1.0 - damping, 0.0),
-        vec2(1.0, 0.0) - damping * positive_double_rotation,
-    );
+    // A real tone mixed down to DC also leaves an image at twice the tuned
+    // frequency. This is the exact one-pole response at that image frequency.
+    // The half-angle form avoids cancellation near DC and needs no epsilon
+    // that would incorrectly attenuate the image at high sample rates.
+    let damping = 1.0 - input_weight;
+    let sine = sin(phase);
+    let denominator_real = input_weight + 2.0 * damping * sine * sine;
+    let denominator_imag = -damping * sin(2.0 * phase);
+    let response = input_weight * vec2(denominator_real, -denominator_imag)
+        / (input_weight * input_weight + 4.0 * damping * sine * sine);
+    var normalized_response = response;
+
+    // Since reset the filter has a finite exponential window, not an infinite
+    // one. Normalize only the image ratio; leave the wanted signal's natural
+    // attack gain intact. Once settled, use the cheaper infinite response.
+    let age = decay_exponent * processed_samples;
+    if (processed_samples > 0.0 && age < 16.0) {
+        let remaining = exp(-age);
+        let gain = one_minus_exp_negative(age);
+        let angle = phase * processed_samples;
+        let sine_age = sin(angle);
+        let finite_window = vec2(
+            gain + 2.0 * remaining * sine_age * sine_age,
+            -remaining * sin(2.0 * angle),
+        );
+        let finite_response = complex_multiply(response, finite_window) / gain;
+        // With very few samples phase and amplitude cannot be distinguished
+        // reliably. Fade to the finite solution only when it is conditioned.
+        let determinant = 1.0 - dot(finite_response, finite_response);
+        normalized_response = mix(
+            response, finite_response, smoothstep(0.05, 0.2, determinant),
+        );
+    }
     let previous_oscillator =
         complex_multiply(oscillator, complex_conjugate(rotation));
     let image_phase = complex_multiply(previous_oscillator, previous_oscillator);
-    let image = complex_multiply(image_response, image_phase);
+    let image = complex_multiply(normalized_response, image_phase);
     let denominator = max(1.0 - dot(image, image), 0.05);
-    let wanted =
-        (state - complex_multiply(image, complex_conjugate(state))) / denominator;
-    return wanted;
+    return (state - complex_multiply(image, complex_conjugate(state))) / denominator;
+}
+
+// Coefficients for A² = calibrated (position² + quadrature_velocity²).
+// Use the recurrence instead of subtracting adjacent positions near DC.
+fn position_velocity_coefficients(rotation: vec2<f32>, input_weight: f32) -> vec3<f32> {
+    let damping = 1.0 - input_weight;
+    let sine = -rotation.y;
+    let cosine = rotation.x;
+    let denominator = vec2(input_weight + 2.0 * damping * sine * sine,
+        2.0 * damping * sine * cosine);
+    let image_response = input_weight * complex_conjugate(denominator)
+        / max(dot(denominator, denominator), 0.00000000000000000001);
+    let calibration = vec2(1.0, 0.0) + image_response;
+    return vec3(input_weight * cosine / max(damping * sine, 0.00000001),
+        1.0 / damping, 4.0 / dot(calibration, calibration));
+}
+
+fn position_velocity_energy(
+    state: vec2<f32>, oscillator: vec2<f32>, rotation: vec2<f32>,
+    coefficients: vec3<f32>, sample: f32,
+) -> f32 {
+    let previous_oscillator = complex_multiply(oscillator, complex_conjugate(rotation));
+    let physical = complex_multiply(state, complex_conjugate(previous_oscillator));
+    let position = physical.x;
+    let velocity_quadrature = coefficients.x * (sample - position) - coefficients.y * physical.y;
+    return coefficients.z * dot(vec2(position, velocity_quadrature), vec2(position, velocity_quadrature));
+}
+
+fn position_velocity_magnitude(
+    state: vec2<f32>, oscillator: vec2<f32>, rotation: vec2<f32>,
+    input_weight: f32, sample: f32,
+) -> f32 {
+    return sqrt(position_velocity_energy(state, oscillator, rotation,
+        position_velocity_coefficients(rotation, input_weight), sample));
 }
 
 fn level_from_amplitude(amplitude: f32, floor_db: f32) -> f32 {
@@ -124,17 +196,24 @@ fn resonate(@builtin(global_invocation_id) id: vec3<u32>) {
     // resonators, while /2 and /1 are supplied by the FFT mapper.
     if (params.hybrid.z > 0.5 && frequency > params.sample_rate * 0.091) { return; }
 
-    var state = states[bin];
+    var state = auxiliary.states[bin];
     if (reset) {
         state.oscillator = vec2(1.0, 0.0);
         state.value = vec2(0.0);
+        state.processed_samples = 0.0;
+        state.last_sample = 0.0;
+        state.energy_cursor = 0u;
+        state.energy_filled = 0u;
+        state.paired_energy = 0.0;
     }
 
     var rate_divisor = 1u;
     var new_count = params.resonator_stream.x;
     if (params.capture.w != 0u) {
         if (
-            params.resonator_stream_extra.x > 0u
+            // Select the stage from configuration, even when this frame has
+            // no /16 samples. Changing the rate would reinterpret stored state.
+            params.resonator_stream_extra.y != 0u
             && frequency <= params.sample_rate * 0.0205
         ) {
             rate_divisor = 16u;
@@ -159,8 +238,19 @@ fn resonate(@builtin(global_invocation_id) id: vec3<u32>) {
         1.0,
     );
     let q = mix(params.resonator.x, params.resonator.y, q_t);
-    let damping = exp(-PI * frequency / (max(q, 0.01) * effective_rate));
+    let decay_exponent = PI * frequency / (max(q, 0.01) * effective_rate);
+    let input_weight = one_minus_exp_negative(decay_exponent);
     let full_rate_start = MAX_SAMPLE_COUNT - min(new_count, MAX_SAMPLE_COUNT);
+
+    let pair_measurement = params.resonator.z > 2.5;
+    let position_only = params.resonator.z > 3.5;
+    let energy_stride = params.resonator_stream_extra.z;
+    let energy_offset = bin * energy_stride;
+    let quarter_delay = effective_rate / (4.0 * frequency);
+    let delay_low = u32(floor(quarter_delay));
+    let delay_fraction = fract(quarter_delay);
+    var energy_coefficients = vec3(0.0);
+    if (pair_measurement) { energy_coefficients = position_velocity_coefficients(rotation, input_weight); }
 
     for (var index = 0u; index < new_count; index++) {
         var sample = samples[full_rate_start + index];
@@ -173,15 +263,58 @@ fn resonate(@builtin(global_invocation_id) id: vec3<u32>) {
         } else if (rate_divisor == 16u) {
             sample = sixteenth_rate_samples[index];
         }
+        state.last_sample = sample;
         let mixed = state.oscillator * sample;
-        state.value = damping * state.value + (1.0 - damping) * mixed;
+        state.value += input_weight * (mixed - state.value);
         state.oscillator = complex_multiply(state.oscillator, rotation);
+        if (pair_measurement) {
+            var current = 0.0;
+            if (position_only) {
+                let previous_oscillator = complex_multiply(state.oscillator, complex_conjugate(rotation));
+                current = complex_multiply(state.value, complex_conjugate(previous_oscillator)).x;
+            } else {
+                current = position_velocity_energy(state.value, state.oscillator,
+                    rotation, energy_coefficients, sample);
+            }
+            auxiliary.history[energy_offset + state.energy_cursor] = current;
+            state.energy_filled = min(state.energy_filled + 1u, energy_stride);
+            var delayed = current;
+            if (state.energy_filled > delay_low + 1u) {
+                let low = (state.energy_cursor + energy_stride - delay_low) % energy_stride;
+                let high = (low + energy_stride - 1u) % energy_stride;
+                delayed = mix(auxiliary.history[energy_offset + low],
+                    auxiliary.history[energy_offset + high], delay_fraction);
+            }
+            if (position_only) {
+                // Interpolate displacement first, then square the two positions.
+                // For a settled on-center sinusoid they are 90 degrees apart.
+                state.paired_energy = energy_coefficients.z * (current * current + delayed * delayed);
+            } else {
+                state.paired_energy = 0.5 * (current + delayed);
+            }
+            state.energy_cursor = (state.energy_cursor + 1u) % energy_stride;
+        }
     }
     state.oscillator /= max(length(state.oscillator), 0.000001);
 
+    if (decay_exponent * state.processed_samples < 16.0) {
+        state.processed_samples += f32(new_count);
+    }
     let previous = spectrum[bin];
-    let phasor = measured_phasor(state.value, state.oscillator, rotation, damping);
-    let amplitude = 2.0 * length(phasor);
+    var amplitude = 0.0;
+    if (pair_measurement) {
+        amplitude = sqrt(state.paired_energy);
+    } else if (params.resonator.z > 1.5) {
+        amplitude = position_velocity_magnitude(
+            state.value, state.oscillator, rotation, input_weight, state.last_sample,
+        );
+    } else {
+        let phasor = measured_phasor(
+            state.value, state.oscillator, rotation, phase, decay_exponent,
+            input_weight, state.processed_samples,
+        );
+        amplitude = 2.0 * length(phasor);
+    }
     var measured = level_from_amplitude(amplitude, floor_db);
     var envelope_state = measured;
     if (!reset) {
@@ -203,5 +336,5 @@ fn resonate(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let hybrid_fft_history = select(0.0, previous.w, params.hybrid.z > 0.5 && !reset);
     spectrum[bin] = vec4(measured, previous.y, envelope_state, hybrid_fft_history);
-    states[bin] = state;
+    auxiliary.states[bin] = state;
 }

@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# Room EQ Wizard measurements (local speaker data, not project code)
+*.mdat
+*.req

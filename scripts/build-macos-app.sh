@@ -2,7 +2,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-cargo build --release
+cargo build --release --bin visual-audio
 app="target/VisualAudio.app"
 mkdir -p "$app/Contents/MacOS"
 cp target/release/visual-audio "$app/Contents/MacOS/visual-audio"

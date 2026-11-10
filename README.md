@@ -173,6 +173,43 @@ can add up to three visual frames of FFT response delay.
   varies smoothly between 50 Hz and 10 kHz. Its output envelope has configurable
   decay and peak/decay ordering. Optional multirate processing, a fifth /16 stage,
   and timestamp alignment remain available.
+  Phase-corrected magnitude accounts for the finite filter history after reset,
+  then uses the settled response. It preserves the resonator's natural attack
+  instead of normalizing it away. Very short, poorly conditioned histories blend
+  back toward the settled correction. Stable small-exponent calculations improve
+  precision at low frequencies and high Q. This adds one scalar of state per bin
+  within the existing auxiliary allocation, with no extra audio buffer or delay.
+  The startup history begins at analyzer reset; this is not an onset detector
+  or a way to remove the Q-dependent response time.
+  Both envelope modes retain the responsive frame-end measurement instead of
+  holding a maximum from earlier in the audio block. The /16 stage stays
+  selected on empty updates, avoiding changes in how stored state is measured.
+  The optional **Position + velocity** measurement estimates amplitude from
+  displacement and normalized velocity together: `A ≈ sqrt(x² + (v/ω)²)`.
+  It uses an exact adjacent-sample quadrature difference for a tone at the bin
+  frequency, evaluated through the resonator recurrence to avoid cancellation.
+  On-center gain is calibrated. One latest-sample scalar fits inside the existing
+  auxiliary allocation; empty updates retain it. There is no block maximum,
+  lookahead, amplitude smoothing, or additional peak hold. Startup and off-center
+  response can differ from complex magnitude. The existing magnitude estimator
+  already uses quadrature, so this alternative is not guaranteed to respond
+  faster than it. Compare under **Resonator tuning → Level measurement**;
+  the saved selection and default remain unchanged.
+  **Position + velocity, π/2 pair** combines two complete position/velocity
+  measurements, one current and one delayed by a quarter-cycle at that bin:
+  `A = sqrt((E_now + E_delayed) / 2)`, where `E = x² + (v/ω)²` after calibration.
+  Energy history is updated at each audio sample, with linear interpolation for
+  fractional delays. Only this mode allocates the history; changing the range,
+  multirate stages, or measurement resizes/releases it as needed. The second
+  measurement is 5 ms old at 50 Hz and 15.625 ms old at 16 Hz. Fresh measurements
+  still contribute immediately, but averaging can soften onset and extend tails.
+  It targets phase-related energy ripple rather than guaranteeing less noise
+  or faster response on every signal. The FFT portion of hybrid mode is unchanged.
+  **Position only, π/2 pair** uses the real resonator displacement at those two
+  times instead: `A ∝ sqrt(x_now² + x_delayed²)`, calibrated for on-center gain.
+  It does not measure velocity. Fractional delay interpolates displacement before
+  squaring; its response can still vary during transients or for off-center tones.
+  It shares the on-demand quarter-cycle history and its timing tradeoff.
 - Standalone 3-band and 5-band FFT modes and the auditory ERB analyzer remain
   selectable. FFT modes expose band sizes, decimation, crossover frequencies,
   and normalized Hann, Half-Hann, Half-Blackman, Kaiser, or Flanagan windows.
@@ -208,15 +245,27 @@ can add up to three visual frames of FFT response delay.
   The smooth floor curve defaults to -51 dB at the low end and -62 dB at the
   high end. Fixed-width bars support a configurable frequency focus lens;
   musical-note layout gives each semitone equal width.
-- Mailbox VSync (FIFO fallback) follows the active display's refresh rate. GPU
-  work is briefly deferred during live window movement and resize. Axis-label
-  layout runs only within the ten-pixel-high text strip; overlay draws are
-  scissored to that strip.
+- Frames follow the display's actual refresh rate through FIFO VSync (Metal
+  has no Mailbox mode). Each frame first waits for a drawable, then reads the
+  newest audio, so samples do not age during that wait, and at most one frame
+  is queued (two drawables). The next frame is requested half a refresh
+  interval after the previous one, so the drawable wait aligns it with the
+  display without missing a refresh. Measured with the default hybrid
+  profile: an even 120 fps at 120 Hz (previously about 103 fps from a timer
+  that drifted later each frame), and an even 60 fps when Low Power Mode
+  limits the display to 60 Hz. At 60 Hz, audio read for a frame is under 1 ms
+  old at presentation instead of about 7 ms, and one fewer frame waits in the
+  queue. GPU work is briefly deferred during live window movement and resize.
+  Axis-label layout runs only within the ten-pixel-high text strip; overlay
+  draws are scissored to that strip.
+- While the visualizer window is fully hidden, rendering stops (macOS can
+  withhold drawables for up to a second). The capture ring is still drained
+  every 250 ms, and analyzers restart from the continuous history when the
+  window is visible again.
 
 Run CPU and shader-validation checks with `cargo test --offline`. The additional
 Metal resource check can be run on a Mac with
 `cargo test --offline gpu_analyzers_validate_with_lazy_buffers -- --ignored`.
-
 The note overlay has a separate Metal check for octave folding, stereo input,
 frequency focus, note layout, silence, fast audio input, and opaque/transparent rendering:
 `cargo test --offline gpu_note_activity_tracks_octaves_stereo_release_and_renders -- --ignored`.
@@ -247,3 +296,90 @@ pass: `cargo test --offline gpu_note_ribbon_render_optimization -- --ignored --n
 Both checks allow at most one 8-bit rounding step per channel; the ribbon
 comparisons currently match exactly. Resolution, frame rate, and effects are
 unchanged. Timings report isolated completed batches, not whole-app GPU usage.
+
+The numerical magnitude regression test requires Metal access:
+
+```sh
+cargo test --offline phase_corrected_magnitude_matches_weighted_tone_fit -- --ignored --nocapture
+```
+
+It compares the production WGSL correction with an independent weighted
+least-squares fit across 1,440 synthetic cases (phase changes, detuned tones,
+mixtures, and bursts), checks bounded output during short histories, and exercises
+streaming updates, empty updates (including /16), and resets through the full
+resonator shader. A short-burst regression checks that both envelope modes preserve frame-end
+measurement and decay evenly over the following silent frames.
+
+The same GPU test validates position/velocity measurement against 1,440 independent
+adjacent-position references, including displacement near zero, and checks the
+full streaming short-burst release in both measurement modes.
+
+Quarter-cycle pairing is checked through the production Metal shader against an
+independent fractional-delay energy reference and subsequent release frames.
+
+## WaveAudio — separate waveform app
+
+WaveAudio is an independent executable and macOS app. Both apps share
+`visual_audio::audio`, including native capture and output-device latency
+reporting. WaveAudio does not read or change VisualAudio's saved settings.
+`cargo run` still starts VisualAudio.
+
+```sh
+sh scripts/build-wave-audio-app.sh
+open target/WaveAudio.app
+# Synthetic visual inputs; no capture or sound playback:
+cargo run --release --bin wave-audio -- --demo
+cargo run --release --bin wave-audio -- --demo-tone 59.94
+cargo run --release --bin wave-audio -- --demo-beats
+# A fixed 60 Hz timebase is the Min=Max special case:
+cargo run --release --bin wave-audio -- --demo --min-hz 60 --max-hz 60
+# Optional microphone/loopback input:
+cargo run --release --bin wave-audio -- --device NAME
+```
+
+There is **one waveform**, with reference F varying continuously from Min at
+screen left to Max at screen right. Defaults are 60–6000 Hz (limited by the input
+sample rate), logarithmic spacing, continuous scrolling (phase lock off) and
+target 120 FPS.
+Set Min=Max to recover the fixed-F oscilloscope timebase.
+
+For `u = x / width` increasing from **left to right**:
+
+```
+F(u) = Min * (Max / Min)^u          # Log spacing enabled
+F(u) = Min + (Max - Min)*u          # Log spacing disabled
+y(u) = audio(t_anchor - (1-u)/F(u))
+```
+
+These are direct reads from the same raw audio buffer with linear interpolation.
+The changing timebase stretches the full signal horizontally; it does not isolate
+frequencies or give individual input tones separate propagation speeds. Frequency
+labels beneath the curve show F(u).
+
+- **Lock phase to Min:** use one shared endpoint
+  `t_anchor = floor(t * Min) / Min`, with t measured in captured sample time after
+  output-delay compensation. A tone exactly at Min (or an integer harmonic)
+  stays stationary. All x positions share that endpoint: independently quantizing
+  by F(u) would introduce spatial discontinuities. This does not lock every
+  frequency simultaneously and is not automatic frequency detection.
+- **Continuous scrolling (default):** with phase lock disabled, use the current delayed sample
+  time directly. At Min=Max=60 Hz and 120 FPS, two successive frames of a pure
+  60 Hz tone have opposite phases unless phase lock is enabled.
+- **Target FPS:** defaults to 120, independently of F(u). Actual presentation is
+  limited by the display/VSync and rendering work. All sampling positions come
+  from audio timestamps, not a per-frame scroll increment.
+- **Dense portions:** each pixel uses extrema of its actual raw-sample interval
+  when that interval spans more than one sample. The continuous signed curve is
+  also drawn; there are no additional frequency traces. Missing history stays
+  blank. At high reference frequencies only a few captured samples represent a
+  period, so interpolated shapes are limited by the sample rate.
+- **Output timing:** native capture follows reported device delay, with a signed
+  manual adjustment. Phase lock can hold the endpoint for less than one Min
+  period. Left and Right can be selected without mixing channels.
+
+There is no Fourier transform, filter bank, dispersion simulation, envelope or
+smoothing in WaveAudio. Four seconds of history cover the minimum 1 Hz reference,
+phase hold and up to 1.5 seconds of output compensation. Controls last for the
+current launch and are not saved. VisualAudio's spectrum analyzers are independent.
+The previous multiple-row controls and `--multiple` / `--frequency` flags have
+been removed in favor of `--min-hz` and `--max-hz` on the single curve.

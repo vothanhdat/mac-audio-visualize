@@ -13,11 +13,11 @@ use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
-    audio::SampleRing,
     hybrid_matcher::{HybridBandMatcher, HybridMatchConfig},
     multirate_fft::{MultirateConfig, MultirateFft},
     resonator_resampler::ResonatorResampler,
 };
+use visual_audio::audio::SampleRing;
 
 #[path = "note_ribbon.rs"]
 mod note_ribbon;
@@ -316,7 +316,11 @@ enum ResonatorEnvelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ResonatorMeasurement {
     RawMagnitude,
+    #[serde(alias = "PhaseTracked")]
     ImageRejected,
+    PositionVelocity,
+    PositionVelocityPi2,
+    PositionPi2,
 }
 
 impl ResonatorMeasurement {
@@ -324,6 +328,9 @@ impl ResonatorMeasurement {
         match self {
             Self::RawMagnitude => "Raw magnitude",
             Self::ImageRejected => "Phase-corrected magnitude",
+            Self::PositionVelocity => "Position + velocity",
+            Self::PositionVelocityPi2 => "Position + velocity, π/2 pair",
+            Self::PositionPi2 => "Position only, π/2 pair",
         }
     }
 
@@ -331,6 +338,9 @@ impl ResonatorMeasurement {
         match self {
             Self::RawMagnitude => 0.0,
             Self::ImageRejected => 1.0,
+            Self::PositionVelocity => 2.0,
+            Self::PositionVelocityPi2 => 3.0,
+            Self::PositionPi2 => 4.0,
         }
     }
 }
@@ -1118,6 +1128,9 @@ fn draw_settings_panel(
                                 for measurement in [
                                     ResonatorMeasurement::RawMagnitude,
                                     ResonatorMeasurement::ImageRejected,
+                                    ResonatorMeasurement::PositionVelocity,
+                                    ResonatorMeasurement::PositionVelocityPi2,
+                                    ResonatorMeasurement::PositionPi2,
                                 ] {
                                     ui.selectable_value(
                                         &mut settings.resonator_measurement,
@@ -1127,8 +1140,17 @@ fn draw_settings_panel(
                                 }
                             });
                         ui.small(
-                            "Phase-corrected magnitude removes the counter-rotating image without adding a sample window or extra memory.",
+                            "Phase-corrected magnitude removes the counter-rotating image, accounts for filter startup, and preserves the natural attack without an extra sample buffer.",
                         );
+                        if settings.resonator_measurement == ResonatorMeasurement::PositionVelocity {
+                            ui.small("Measures position and discrete velocity together to estimate amplitude before position reaches its peak. No peak hold or lookahead; transient response can differ from phase-corrected magnitude.");
+                        }
+                        if settings.resonator_measurement == ResonatorMeasurement::PositionVelocityPi2 {
+                            ui.small("Averages position/velocity energy now and one quarter-cycle earlier. Reduces phase-related ripple; the delayed energy can soften attacks and lengthen the tail, especially in bass.");
+                        }
+                        if settings.resonator_measurement == ResonatorMeasurement::PositionPi2 {
+                            ui.small("Uses position now and one quarter-cycle earlier: sqrt(x_now² + x_delayed²), with gain calibration. No velocity measurement. The delayed position can soften attacks and extend tails.");
+                        }
                         ui.checkbox(
                             &mut settings.resonator_multirate,
                             "Multirate resonator optimization",
@@ -2119,7 +2141,7 @@ pub struct GpuState {
     analyzers: Vec<AnalyzerChannel>,
     compute_bind_group_layout: wgpu::BindGroupLayout,
     render_bind_group_layout: wgpu::BindGroupLayout,
-    resource_mode: (AnalysisMethod, bool, bool, usize),
+    resource_mode: (AnalysisMethod, bool, bool, usize, usize),
     target_features: (bool, bool, bool),
     left_history: Vec<f32>,
     right_history: Vec<f32>,
@@ -2145,6 +2167,9 @@ pub struct GpuState {
     last_multirate_crossovers: [f32; 4],
     last_peak_momentum: bool,
     resonator_needs_reset: bool,
+    // Samples were drained without analysis (hidden window); streaming
+    // analyzers must restart from the contiguous history.
+    audio_gap: bool,
     settings_path: PathBuf,
     settings: VisualizerSettings,
     settings_dirty: bool,
@@ -2217,13 +2242,9 @@ impl GpuState {
             .copied()
             .find(|format| format.is_srgb() && controls_caps.formats.contains(format))
             .unwrap_or(caps.formats[0]);
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            // Mailbox is VSync-safe but does not block the event thread waiting
-            // for an older queued frame, which keeps window interaction fluid.
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // FIFO's drawable wait paces frames to the display refresh (the event
+        // loop relies on it). Metal offers no Mailbox mode in any case.
+        let present_mode = wgpu::PresentMode::Fifo;
         let alpha_mode = if caps
             .alpha_modes
             .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
@@ -2245,7 +2266,10 @@ impl GpuState {
             present_mode,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // At most one queued frame (two drawables on Metal): if frames are
+            // produced faster than the display, a full queue adds one refresh
+            // of latency rather than two. Frames take well under a millisecond.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
         let controls_config = wgpu::SurfaceConfiguration {
@@ -2677,6 +2701,7 @@ impl GpuState {
                 settings.resonator_multirate,
                 settings.resonator_five_stage,
                 fft_magnitude_count(&settings),
+                quarter_energy_stride(&settings, sample_rate as f32),
             ),
             target_features: visual_target_features(&settings),
             left_history: vec![0.0; history_sample_count],
@@ -2719,6 +2744,7 @@ impl GpuState {
             last_multirate_crossovers: multirate_crossovers(&settings),
             last_peak_momentum: settings.peak_momentum,
             resonator_needs_reset: true,
+            audio_gap: false,
             settings_path,
             settings,
             settings_dirty: false,
@@ -2763,6 +2789,7 @@ impl GpuState {
             self.settings.resonator_multirate,
             self.settings.resonator_five_stage,
             fft_magnitude_count(&self.settings),
+            quarter_energy_stride(&self.settings, self.sample_rate),
         );
         let count = self.settings.channel_mode.channel_count();
         if self.resource_mode != resource_mode {
@@ -2995,6 +3022,14 @@ impl GpuState {
         }
     }
 
+    /// Keep the capture ring from filling while the visualizer is hidden. The
+    /// samples join the shared history, so the next frame analyzes current audio.
+    pub fn drain_hidden_audio(&mut self, ring: &SampleRing) {
+        if ring.drain_latest(&mut self.left_history, &mut self.right_history) > 0 {
+            self.audio_gap = true;
+        }
+    }
+
     pub fn adjust_gain(&mut self, multiplier: f32) {
         self.settings.gain = (self.settings.gain * multiplier).clamp(0.1, 20.0);
         self.mark_settings_dirty();
@@ -3044,6 +3079,13 @@ impl GpuState {
         self.apply_pending_resize();
         self.apply_surface_history_size();
         self.prepare_resources();
+        // Waiting for a drawable paces frames to the display (FIFO on Metal).
+        // Wait before reading audio so the analyzed samples are as recent as
+        // possible when this frame is presented, rather than aging during the wait.
+        let frame = self.surface.get_current_texture()?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let now = Instant::now();
         let frame_delta = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -3115,7 +3157,9 @@ impl GpuState {
             bin_count != self.last_bin_count || frequency_mapping != self.last_frequency_mapping;
         let method_changed = self.settings.analysis_method != self.last_analysis_method;
         let channel_mode_changed = self.settings.channel_mode != self.last_channel_mode;
-        let delay_changed = delay_samples != self.last_delay_samples;
+        // An unanalyzed gap breaks streaming state just like a delay change.
+        let delay_changed =
+            delay_samples != self.last_delay_samples || std::mem::take(&mut self.audio_gap);
         if let Some(ribbon) = &mut self.note_ribbon {
             ribbon.update_audio(
                 &self.queue,
@@ -3430,10 +3474,6 @@ impl GpuState {
                 }),
             );
         }
-        let frame = self.surface.get_current_texture()?;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let transparent_background = self.settings.transparent_background;
         let surface_mode = self.settings.render_mode == RenderMode::Surface3d;
         let peak_trail_enabled = surface_mode && self.settings.surface_peak_trail_enabled;
@@ -4220,7 +4260,12 @@ fn analysis_params(
             },
             1.0,
         ],
-        resonator_stream_extra: [resonator_stream[4], 0, 0, 0],
+        resonator_stream_extra: [
+            resonator_stream[4],
+            u32::from(settings.resonator_five_stage),
+            quarter_energy_stride(settings, timing[0]) as u32,
+            0,
+        ],
         hybrid_match_corrections,
     }
 }
@@ -4306,6 +4351,33 @@ fn multirate_config(settings: &VisualizerSettings) -> MultirateConfig {
             flanagan_alpha: settings.flanagan_alpha,
         }
     }
+}
+
+fn quarter_energy_stride(settings: &VisualizerSettings, sample_rate: f32) -> usize {
+    if !matches!(
+        settings.resonator_measurement,
+        ResonatorMeasurement::PositionVelocityPi2 | ResonatorMeasurement::PositionPi2
+    ) || !matches!(
+        settings.analysis_method,
+        AnalysisMethod::ResonatorBank | AnalysisMethod::HybridResonatorFft
+    ) {
+        return 0;
+    }
+    let frequency = settings.min_frequency_hz.max(16.0);
+    let divisor = if !settings.resonator_multirate {
+        1.0
+    } else if settings.resonator_five_stage && frequency <= sample_rate * 0.0205 {
+        16.0
+    } else if frequency <= sample_rate * 0.041 {
+        8.0
+    } else if frequency <= sample_rate * 0.091 {
+        4.0
+    } else if frequency <= sample_rate * 0.181 {
+        2.0
+    } else {
+        1.0
+    };
+    (sample_rate / (4.0 * frequency * divisor)).ceil() as usize + 2
 }
 
 fn fft_magnitude_count(settings: &VisualizerSettings) -> usize {
@@ -4445,7 +4517,10 @@ fn create_analyzer_channel(
     let resonator_state_buffer = storage_buffer(
         device,
         &format!("{prefix} analysis auxiliary state"),
-        MAX_BIN_COUNT as u64 * 16,
+        MAX_BIN_COUNT as u64 * 16
+            + (quarter_energy_stride(settings, initial_params.sample_rate) as u64
+                * MAX_BIN_COUNT as u64)
+                .max(4),
     );
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(&format!("{prefix} analysis parameters")),
@@ -4886,6 +4961,20 @@ mod tests {
     }
 
     #[test]
+    fn quarter_cycle_history_is_allocated_only_for_selected_resonators() {
+        let mut settings = VisualizerSettings::default();
+        assert_eq!(quarter_energy_stride(&settings, 48000.0), 0);
+        settings.resonator_measurement = ResonatorMeasurement::PositionVelocityPi2;
+        assert_eq!(quarter_energy_stride(&settings, 48000.0), 49);
+        settings.resonator_measurement = ResonatorMeasurement::PositionPi2;
+        assert_eq!(quarter_energy_stride(&settings, 48000.0), 49);
+        settings.resonator_multirate = false;
+        assert_eq!(quarter_energy_stride(&settings, 48000.0), 752);
+        settings.analysis_method = AnalysisMethod::MultirateFft;
+        assert_eq!(quarter_energy_stride(&settings, 48000.0), 0);
+    }
+
+    #[test]
     fn visual_resources_follow_enabled_effects() {
         let mut settings = VisualizerSettings::default();
         assert_eq!(visual_target_features(&settings), (false, false, false));
@@ -4951,6 +5040,13 @@ mod tests {
                         let settings = VisualizerSettings {
                             analysis_method: method,
                             resonator_multirate: multirate,
+                            resonator_measurement: if five_stage && multirate {
+                                ResonatorMeasurement::PositionVelocityPi2
+                            } else if five_stage {
+                                ResonatorMeasurement::PositionPi2
+                            } else {
+                                ResonatorMeasurement::ImageRejected
+                            },
                             resonator_five_stage: five_stage,
                             ..VisualizerSettings::default()
                         };
@@ -5032,7 +5128,8 @@ mod tests {
             let _ = build_peak_volume_pipeline(&device, &render_pipeline_layout, format);
             let _ = build_axis_overlay_pipeline(&device, &render_pipeline_layout, format);
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            assert!(device.pop_error_scope().await.is_none());
+            let error = device.pop_error_scope().await;
+            assert!(error.is_none(), "GPU validation failed: {error:?}");
         });
     }
 
@@ -5122,6 +5219,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "resonator_measurement_tests.rs"]
+mod resonator_measurement_tests;
 
 #[cfg(test)]
 #[path = "gpu_performance_tests.rs"]

@@ -2,7 +2,12 @@
 name = "visual-audio"
 version = "0.1.0"
 edition = "2024"
+default-run = "visual-audio"
 license = "MIT"
+
+[[bin]]
+name = "wave-audio"
+path = "src/bin/wave_audio.rs"
 
 [dependencies]
 anyhow = "1.0"

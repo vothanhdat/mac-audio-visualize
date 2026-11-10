@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=native/system_audio.m");
     println!("cargo:rerun-if-changed=macos/Info.plist");
+    println!("cargo:rerun-if-changed=macos/WaveAudio-Info.plist");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -44,5 +45,10 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Foundation");
     // Give `cargo run` the same audio-capture usage description as the app bundle.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{manifest}/macos/Info.plist");
+    println!(
+        "cargo:rustc-link-arg-bin=visual-audio=-Wl,-sectcreate,__TEXT,__info_plist,{manifest}/macos/Info.plist"
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=wave-audio=-Wl,-sectcreate,__TEXT,__info_plist,{manifest}/macos/WaveAudio-Info.plist"
+    );
 }

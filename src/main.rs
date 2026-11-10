@@ -88,7 +88,7 @@ impl ApplicationHandler for App {
         let gpu = match pollster::block_on(GpuState::new(
             Arc::clone(&window),
             Arc::clone(&controls_window),
-            self.audio.sample_rate,
+            self.audio.sample_rate(),
             self.profile.as_deref(),
         )) {
             Ok(gpu) => gpu,
@@ -306,7 +306,9 @@ fn main() -> Result<()> {
     };
     eprintln!(
         "capturing {} at {} Hz, {} channel(s)",
-        audio.device_name, audio.sample_rate, audio.channels
+        audio.device_name,
+        audio.sample_rate(),
+        audio.channels
     );
     let event_loop = EventLoop::new().context("could not create the event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);

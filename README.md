@@ -18,6 +18,25 @@ New profiles and **Reset** use the saved configuration adopted on October 20,
 mirror, and a 16 Hz–22.5 kHz frequency range. Existing profiles keep their saved
 settings. Automatic output synchronization is enabled by default.
 
+## Install
+
+With Homebrew on an Apple Silicon Mac running macOS 14.2 or newer:
+
+```sh
+brew install --cask vothanhdat/tap/visual-audio
+```
+
+Open **VisualAudio** from Applications and allow **System Audio Recording**
+when macOS asks. Update with `brew upgrade --cask visual-audio`; remove with
+`brew uninstall --cask visual-audio` (add `--zap` to also delete settings).
+The app is ad-hoc signed, not notarized, so the cask clears the quarantine
+flag after installing. Because of that ad-hoc signature, macOS may ask for the
+recording permission again after an update.
+
+To publish a release, run `sh scripts/package-release.sh`. It builds the app,
+checks that the bundle version matches `Cargo.toml`, and writes
+`dist/VisualAudio-VERSION.zip` and its SHA-256 for the cask.
+
 ## System audio capture (default)
 
 No BlackHole, virtual audio driver, or Multi-Output Device is required. Keep

@@ -29,8 +29,9 @@ struct RenderChannelParams {
     _padding_0: f32,
     _padding_1: f32,
     _padding_2: f32,
-    // Linear-light low, middle and high colors; alpha is unused.
-    palette: array<vec4<f32>, 3>,
+    // Color stops in position order: linear color in rgb and position across
+    // the frequency axis (0 to 1) in w.
+    palette: array<vec4<f32>, 5>,
 }
 
 @group(0) @binding(7) var<storage, read> spectrum: array<vec4<f32>>;
@@ -505,13 +506,20 @@ struct FlatBarOut {
     @location(2) reflection_alpha: f32,
 }
 
-// The selected palette blended across the frequency axis: low to middle over
-// the lower half, middle to high above it.
+// The selected palette across the frequency axis: blend between neighboring
+// stops, and hold the first and last colors beyond them. Segments below bin_t
+// mix fully to their stop, segments above it not at all. Stops at the same
+// position make a hard edge.
 fn palette_color(bin_t: f32) -> vec3<f32> {
-    let low = render_channel.palette[0].rgb;
-    let middle = render_channel.palette[1].rgb;
-    let high = render_channel.palette[2].rgb;
-    return mix(mix(low, middle, min(bin_t * 2.0, 1.0)), high, max(bin_t * 2.0 - 1.0, 0.0));
+    var color = render_channel.palette[0].rgb;
+    for (var i = 1u; i < 5u; i = i + 1u) {
+        let previous = render_channel.palette[i - 1u].w;
+        let next = render_channel.palette[i];
+        let span = next.w - previous;
+        let ramp = clamp((bin_t - previous) / max(span, 1e-6), 0.0, 1.0);
+        color = mix(color, next.rgb, select(step(next.w, bin_t), ramp, span > 0.0));
+    }
+    return color;
 }
 
 fn flat_bar_light(bin_t: f32, energy: f32, response: f32) -> vec3<f32> {

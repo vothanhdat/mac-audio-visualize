@@ -55,10 +55,9 @@ fn glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 }
 
 fn glow_fs(in: BarOut) -> @location(0) vec4<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(mix(low, middle, min(in.bin_t * 2.0, 1.0)), high, max(in.bin_t * 2.0 - 1.0, 0.0));
+    // Both renderers share the current palette; this compares bar geometry
+    // and passes, not palette arithmetic.
+    let frequency_color = palette_color(in.bin_t);
     let horizontal = pow(max(1.0 - abs(in.uv.x * 2.0 - 1.0), 0.0), 3.0);
     let onset = in.transient * params.frequency_range.w;
     let strength = horizontal * smoothstep(0.45, 1.0, in.energy) *

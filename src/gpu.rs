@@ -85,8 +85,9 @@ struct RenderChannelParams {
     _padding_0: f32,
     _padding_1: f32,
     _padding_2: f32,
-    /// Linear-light low, middle and high spectrum colors; alpha is unused.
-    palette: [[f32; 4]; 3],
+    /// Spectrum color stops in position order: linear color in rgb and
+    /// position across the frequency axis (0 to 1) in w.
+    palette: [[f32; 4]; PALETTE_STOPS],
 }
 
 #[repr(C)]
@@ -220,8 +221,53 @@ struct VisualizerSettings {
     frequency_focus_origin_percent: f32,
     transparent_background: bool,
     spectrum_palette: SpectrumPalette,
-    /// sRGB low, middle and high colors used when the palette is Custom.
-    custom_palette_srgb: [[u8; 3]; 3],
+    /// Stops used when the palette is Custom, in any order.
+    custom_palette: [ColorStop; PALETTE_STOPS],
+    /// Read only to migrate three-color custom palettes; never saved.
+    #[serde(skip_serializing)]
+    custom_palette_srgb: Option<[[u8; 3]; 3]>,
+}
+
+const PALETTE_STOPS: usize = 5;
+
+/// A linear-light color and its position across the frequency axis, in
+/// percent from the lowest shown frequency (0) to the highest (100).
+type LinearStop = ([f32; 3], f32);
+
+/// One custom palette color, stored as sRGB.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct ColorStop {
+    srgb: [u8; 3],
+    position_percent: f32,
+}
+
+impl ColorStop {
+    fn from_linear((color, position_percent): LinearStop) -> Self {
+        Self {
+            srgb: color.map(egui::ecolor::gamma_u8_from_linear_f32),
+            position_percent,
+        }
+    }
+
+    fn linear(self) -> LinearStop {
+        (
+            self.srgb.map(egui::ecolor::linear_f32_from_gamma_u8),
+            self.position_percent,
+        )
+    }
+}
+
+/// Five stops that draw the same gradient as three colors at 0, 50 and
+/// 100 %: the stops at 25 and 75 % are linear midpoints.
+fn three_color_stops([low, middle, high]: [[f32; 3]; 3]) -> [LinearStop; PALETTE_STOPS] {
+    let midpoint = |a: [f32; 3], b: [f32; 3]| std::array::from_fn(|i| (a[i] + b[i]) * 0.5);
+    [
+        (low, 0.0),
+        (midpoint(low, middle), 25.0),
+        (middle, 50.0),
+        (midpoint(middle, high), 75.0),
+        (high, 100.0),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,9 +304,9 @@ impl SpectrumPalette {
         }
     }
 
-    /// Linear-light low, middle and high colors of a built-in palette.
-    fn preset_colors(self) -> Option<[[f32; 3]; 3]> {
-        Some(match self {
+    /// Stops of a built-in palette; each is a low, middle and high color.
+    fn preset_stops(self) -> Option<[LinearStop; PALETTE_STOPS]> {
+        let colors = match self {
             Self::Default => [[0.08, 0.40, 1.0], [0.02, 0.95, 0.78], [1.0, 0.20, 0.58]],
             Self::Fire => [[0.80, 0.03, 0.02], [1.0, 0.32, 0.0], [1.0, 0.82, 0.18]],
             Self::Ocean => [[0.02, 0.08, 0.90], [0.0, 0.50, 1.0], [0.30, 1.0, 0.92]],
@@ -268,52 +314,73 @@ impl SpectrumPalette {
             Self::Forest => [[0.0, 0.40, 0.16], [0.22, 0.88, 0.08], [0.85, 1.0, 0.14]],
             Self::Monochrome => [[0.68, 0.76, 0.90]; 3],
             Self::Custom => return None,
-        })
+        };
+        Some(three_color_stops(colors))
     }
 }
 
-fn srgb_palette(linear: [[f32; 3]; 3]) -> [[u8; 3]; 3] {
-    linear.map(|color| color.map(egui::ecolor::gamma_u8_from_linear_f32))
-}
-
-/// Linear-light colors for the selected palette, padded for the shader.
-fn shader_palette(settings: &VisualizerSettings) -> [[f32; 4]; 3] {
-    let colors = settings
+/// The selected palette's stops in position order, as linear color in rgb
+/// and position (0 to 1) in w.
+fn shader_palette(settings: &VisualizerSettings) -> [[f32; 4]; PALETTE_STOPS] {
+    let mut stops = settings
         .spectrum_palette
-        .preset_colors()
-        .unwrap_or_else(|| {
-            settings
-                .custom_palette_srgb
-                .map(|color| color.map(egui::ecolor::linear_f32_from_gamma_u8))
-        });
-    colors.map(|[r, g, b]| [r, g, b, 0.0])
+        .preset_stops()
+        .unwrap_or_else(|| settings.custom_palette.map(ColorStop::linear));
+    // Stable, so stops at the same position keep their order: a hard edge.
+    stops.sort_by(|a, b| a.1.total_cmp(&b.1));
+    stops.map(|([r, g, b], position)| [r, g, b, (position / 100.0).clamp(0.0, 1.0)])
 }
 
-/// A strip showing the palette blended across the frequency axis as the
-/// shader does: low to middle over the lower half, middle to high above it.
+/// The shader's palette_color(): blend between neighboring stops, and hold
+/// the first and last colors beyond them.
+fn palette_color(stops: &[[f32; 4]; PALETTE_STOPS], t: f32) -> [f32; 3] {
+    let mut color = [stops[0][0], stops[0][1], stops[0][2]];
+    for pair in stops.windows(2) {
+        let (previous, next) = (pair[0], pair[1]);
+        let span = next[3] - previous[3];
+        let amount = if span > 0.0 {
+            ((t - previous[3]) / span).clamp(0.0, 1.0)
+        } else if t >= next[3] {
+            1.0
+        } else {
+            0.0
+        };
+        for (channel, target) in color.iter_mut().zip(next) {
+            *channel += (target - *channel) * amount;
+        }
+    }
+    color
+}
+
+/// A strip showing the palette across the frequency axis, with a tick under
+/// each custom stop.
 fn palette_preview(ui: &mut egui::Ui, settings: &VisualizerSettings) {
-    const SLICES: usize = 64;
+    const SLICES: usize = 96;
+    const STRIP_HEIGHT: f32 = 10.0;
     let width = ui.available_width().min(240.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
-    let [low, middle, high] = shader_palette(settings);
-    let mix = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] {
-        std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
-    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, STRIP_HEIGHT + 5.0), egui::Sense::hover());
+    let stops = shader_palette(settings);
     let painter = ui.painter_at(rect);
     for slice in 0..SLICES {
         let t = (slice as f32 + 0.5) / SLICES as f32;
-        let [r, g, b, _] = mix(
-            mix(low, middle, (t * 2.0).min(1.0)),
-            high,
-            (t * 2.0 - 1.0).max(0.0),
-        );
+        let [r, g, b] = palette_color(&stops, t);
         let left = rect.left() + rect.width() * slice as f32 / SLICES as f32;
         let right = rect.left() + rect.width() * (slice + 1) as f32 / SLICES as f32;
         painter.rect_filled(
-            egui::Rect::from_x_y_ranges(left..=right + 0.5, rect.y_range()),
+            egui::Rect::from_x_y_ranges(left..=right + 0.5, rect.top()..=rect.top() + STRIP_HEIGHT),
             0.0,
             egui::Color32::from(egui::Rgba::from_rgb(r, g, b)),
         );
+    }
+    if settings.spectrum_palette == SpectrumPalette::Custom {
+        let tick = ui.visuals().strong_text_color();
+        for stop in stops {
+            let x = rect.left() + rect.width() * stop[3];
+            painter.line_segment(
+                [egui::pos2(x, rect.top() + STRIP_HEIGHT), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.5, tick),
+            );
+        }
     }
 }
 
@@ -627,9 +694,11 @@ impl Default for VisualizerSettings {
             frequency_focus_origin_percent: 50.0,
             transparent_background: false,
             spectrum_palette: SpectrumPalette::Default,
-            custom_palette_srgb: srgb_palette(
-                SpectrumPalette::Default.preset_colors().unwrap(),
-            ),
+            custom_palette: SpectrumPalette::Default
+                .preset_stops()
+                .unwrap()
+                .map(ColorStop::from_linear),
+            custom_palette_srgb: None,
         }
     }
 }
@@ -1025,6 +1094,15 @@ impl VisualizerSettings {
         );
         self.surface_peak_trail_capture_interval_frames =
             self.surface_peak_trail_capture_interval_frames.clamp(1, 10);
+        if let Some(colors) = self.custom_palette_srgb.take() {
+            self.custom_palette =
+                three_color_stops(colors.map(|color| color.map(egui::ecolor::linear_f32_from_gamma_u8)))
+                    .map(ColorStop::from_linear);
+        }
+        for (stop, default) in self.custom_palette.iter_mut().zip(defaults.custom_palette) {
+            stop.position_percent =
+                finite_clamp(stop.position_percent, default.position_percent, 0.0, 100.0);
+        }
         self
     }
 }
@@ -1972,18 +2050,35 @@ fn draw_settings_panel(
                         }
                     });
                 if settings.spectrum_palette == SpectrumPalette::Custom {
-                    ui.horizontal(|ui| {
-                        for (color, label) in settings
-                            .custom_palette_srgb
-                            .iter_mut()
-                            .zip(["Low", "Mid", "High"])
-                        {
-                            ui.color_edit_button_srgb(color);
-                            ui.label(label);
-                        }
-                    });
+                    egui::Grid::new("custom palette stops")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            for stop in &mut settings.custom_palette {
+                                ui.color_edit_button_srgb(&mut stop.srgb);
+                                ui.add(
+                                    egui::Slider::new(&mut stop.position_percent, 0.0..=100.0)
+                                        .step_by(1.0)
+                                        .suffix(" %"),
+                                );
+                                ui.end_row();
+                            }
+                        });
                 }
                 palette_preview(ui, settings);
+                if settings.spectrum_palette == SpectrumPalette::Custom {
+                    ui.small(
+                        "0 % is the lowest frequency shown and 100 % the highest. Colors blend \
+                         between neighboring stops; stops at the same position make a hard edge.",
+                    );
+                } else if let Some(stops) = settings.spectrum_palette.preset_stops()
+                    && ui
+                        .small_button("Copy to Custom")
+                        .on_hover_text("Replace the custom stops with this palette to edit it")
+                        .clicked()
+                {
+                    settings.custom_palette = stops.map(ColorStop::from_linear);
+                    settings.spectrum_palette = SpectrumPalette::Custom;
+                }
                 egui::ComboBox::from_label("Render mode")
                     .selected_text(settings.render_mode.label())
                     .show_ui(ui, |ui| {
@@ -5508,49 +5603,124 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    fn assert_color_near(actual: [f32; 3], expected: [f32; 3], tolerance: f32, at: f32) {
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() <= tolerance, "at {at}: {actual:?} vs {expected:?}");
+        }
+    }
+
     #[test]
-    fn spectrum_palette_defaults_and_custom_colors() {
+    fn default_palette_draws_the_original_three_color_gradient() {
         // Settings saved before the palette option keep the original colors.
         let old: VisualizerSettings = serde_json::from_str(r#"{"gain":2.0}"#).unwrap();
         assert_eq!(old.spectrum_palette, SpectrumPalette::Default);
-        assert_eq!(
-            shader_palette(&old),
-            [
-                [0.08, 0.40, 1.0, 0.0],
-                [0.02, 0.95, 0.78, 0.0],
-                [1.0, 0.20, 0.58, 0.0],
-            ]
-        );
-        // Custom starts from the default colors, within 8-bit sRGB rounding.
+        let stops = shader_palette(&old);
+        let (low, middle, high) = ([0.08, 0.40, 1.0], [0.02, 0.95, 0.78], [1.0, 0.20, 0.58]);
+        let mix = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+            std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+        };
+        for step in 0..=200 {
+            let t = step as f32 / 200.0;
+            let original = mix(mix(low, middle, (t * 2.0).min(1.0)), high, (t * 2.0 - 1.0).max(0.0));
+            assert_color_near(palette_color(&stops, t), original, 1e-6, t);
+        }
+        // Custom starts from the same stops, within 8-bit sRGB rounding.
         let custom = VisualizerSettings {
             spectrum_palette: SpectrumPalette::Custom,
-            ..old.clone()
+            ..old
         };
-        for (custom, default) in shader_palette(&custom)
-            .iter()
-            .flatten()
-            .zip(shader_palette(&old).iter().flatten())
-        {
+        for (custom, default) in shader_palette(&custom).iter().flatten().zip(stops.iter().flatten()) {
             assert!((custom - default).abs() < 0.005, "{custom} vs {default}");
         }
-        let red = VisualizerSettings {
-            custom_palette_srgb: [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-            ..custom
-        };
-        assert_eq!(
-            shader_palette(&red),
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ]
-        );
-        let json = serde_json::to_value(&red).unwrap();
-        assert_eq!(json["spectrum_palette"], "Custom");
-        assert_eq!(json["custom_palette_srgb"][0], serde_json::json!([255, 0, 0]));
         for palette in SpectrumPalette::ALL {
-            assert_eq!(palette.preset_colors().is_none(), palette == SpectrumPalette::Custom);
+            assert_eq!(palette.preset_stops().is_none(), palette == SpectrumPalette::Custom);
         }
+    }
+
+    #[test]
+    fn three_color_custom_palettes_migrate_to_stops() {
+        let saved = r#"{"spectrum_palette":"Custom",
+            "custom_palette_srgb":[[255,0,0],[157,217,153],[0,209,255]]}"#;
+        let settings = serde_json::from_str::<VisualizerSettings>(saved)
+            .unwrap()
+            .sanitized();
+        assert_eq!(settings.spectrum_palette, SpectrumPalette::Custom);
+        assert_eq!(settings.custom_palette_srgb, None);
+        let stops = settings.custom_palette;
+        assert_eq!(
+            stops.map(|stop| stop.position_percent),
+            [0.0, 25.0, 50.0, 75.0, 100.0]
+        );
+        assert_eq!([stops[0].srgb, stops[2].srgb, stops[4].srgb], [
+            [255, 0, 0],
+            [157, 217, 153],
+            [0, 209, 255]
+        ]);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert!(json.get("custom_palette_srgb").is_none());
+        assert_eq!(json["custom_palette"][2]["srgb"], serde_json::json!([157, 217, 153]));
+        assert_eq!(json["custom_palette"][2]["position_percent"], 50.0);
+        let reloaded: VisualizerSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(reloaded.sanitized(), settings);
+    }
+
+    #[test]
+    fn custom_stops_blend_in_position_order() {
+        let stop = |srgb, position_percent| ColorStop {
+            srgb,
+            position_percent,
+        };
+        let (red, green, blue, white) = ([255, 0, 0], [0, 255, 0], [0, 0, 255], [255; 3]);
+        let settings = VisualizerSettings {
+            spectrum_palette: SpectrumPalette::Custom,
+            // Out of order; green and white share 50 % for a hard edge, and
+            // the two blue stops at 0 % hold blue at the low end.
+            custom_palette: [
+                stop(red, 100.0),
+                stop(green, 50.0),
+                stop(blue, 0.0),
+                stop(white, 50.0),
+                stop(blue, 0.0),
+            ],
+            ..Default::default()
+        };
+        let stops = shader_palette(&settings);
+        assert_eq!(stops.map(|stop| stop[3]), [0.0, 0.0, 0.5, 0.5, 1.0]);
+        for (t, expected) in [
+            (0.0, [0.0, 0.0, 1.0]),
+            (0.25, [0.0, 0.5, 0.5]),
+            (0.4999, [0.0, 0.9998, 0.0002]),
+            (0.5, [1.0, 1.0, 1.0]),
+            (0.75, [1.0, 0.5, 0.5]),
+            (1.0, [1.0, 0.0, 0.0]),
+        ] {
+            assert_color_near(palette_color(&stops, t), expected, 1e-4, t);
+        }
+        // Colors hold beyond the outermost stops.
+        let inset = VisualizerSettings {
+            custom_palette: [
+                stop(blue, 20.0),
+                stop(blue, 20.0),
+                stop(green, 50.0),
+                stop(red, 80.0),
+                stop(red, 80.0),
+            ],
+            ..settings
+        };
+        let stops = shader_palette(&inset);
+        assert_color_near(palette_color(&stops, 0.1), [0.0, 0.0, 1.0], 0.0, 0.1);
+        assert_color_near(palette_color(&stops, 0.35), [0.0, 0.5, 0.5], 1e-6, 0.35);
+        assert_color_near(palette_color(&stops, 0.9), [1.0, 0.0, 0.0], 0.0, 0.9);
+    }
+
+    #[test]
+    fn custom_stop_positions_are_clamped() {
+        let mut settings = VisualizerSettings::default();
+        settings.custom_palette[0].position_percent = -20.0;
+        settings.custom_palette[1].position_percent = f32::NAN;
+        settings.custom_palette[4].position_percent = 150.0;
+        let positions = settings.sanitized().custom_palette.map(|stop| stop.position_percent);
+        assert_eq!(positions, [0.0, 25.0, 50.0, 75.0, 100.0]);
     }
 
     #[test]

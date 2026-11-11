@@ -378,16 +378,45 @@ reporting. WaveAudio does not read or change VisualAudio's saved settings.
 sh scripts/build-wave-audio-app.sh
 open target/WaveAudio.app
 # Synthetic visual inputs; no capture or sound playback:
-cargo run --release --bin wave-audio -- --demo
-cargo run --release --bin wave-audio -- --demo-tone 59.94
-cargo run --release --bin wave-audio -- --demo-beats
-# A fixed 60 Hz timebase is the Min=Max special case:
+cargo run --release --bin wave-audio -- --demo-tone 440
+cargo run --release --bin wave-audio -- --demo-chord
+cargo run --release --bin wave-audio -- --demo-bass
+# Open the original time sweep with a fixed 60 Hz timebase:
 cargo run --release --bin wave-audio -- --demo --min-hz 60 --max-hz 60
 # Optional microphone/loopback input:
 cargo run --release --bin wave-audio -- --device NAME
 ```
 
-There is **one waveform**, with reference F varying continuously from Min at
+### 12 notes (default)
+
+Each lane sums the signed output of the bandpass filters for its pitch class
+across C2 to B6. The A lane combines
+A2, A3, A4, A5, and A6 sample by sample. The traces swing above and below
+zero on a linear amplitude scale.
+
+**Phase lock** is on by default. Each lane uses a rising zero crossing in its
+strongest octave to hold a steady tone in place. The label shows the trigger
+octave, and **Cycles** sets the visible span (1–12, default 3). Lanes with
+several notes in different octaves can still move as those notes overlap.
+Turn off **Phase lock** to use the shared **Time window** of 20 to 500 ms
+with the newest audio on the right.
+
+The filters clear their tails after 15 ms of silence. If the audio device
+stops sending samples, the note view starts counting silence after 40 ms.
+
+**Max filter delay** caps each note band's group delay at its center frequency.
+It ranges from 60 to 250 ms and defaults to 100 ms. Lower values widen the bass
+filters so notes appear sooner, with more spill between neighboring lanes.
+
+Lower notes take longer to separate, and harmonics from one instrument can
+appear in other lanes. **Time sweep** switches to the original raw view.
+Returning to **12 notes** starts fresh note history.
+
+### Time sweep
+
+Select **Time sweep** in the app or launch with `--sweep`. Passing
+`--min-hz` or `--max-hz` also opens this view.
+There is one waveform, with reference F varying continuously from Min at
 screen left to Max at screen right. Defaults are 60–6000 Hz (limited by the input
 sample rate), logarithmic spacing, continuous scrolling (phase lock off) and
 target 120 FPS.
@@ -427,9 +456,6 @@ labels beneath the curve show F(u).
   manual adjustment. Phase lock can hold the endpoint for less than one Min
   period. Left and Right can be selected without mixing channels.
 
-There is no Fourier transform, filter bank, dispersion simulation, envelope or
-smoothing in WaveAudio. Four seconds of history cover the minimum 1 Hz reference,
-phase hold and up to 1.5 seconds of output compensation. Controls last for the
-current launch and are not saved. VisualAudio's spectrum analyzers are independent.
-The previous multiple-row controls and `--multiple` / `--frequency` flags have
-been removed in favor of `--min-hz` and `--max-hz` on the single curve.
+Time sweep reads the raw samples directly. Four seconds of history cover the
+minimum 1 Hz reference, phase hold and up to 1.5 seconds of output compensation.
+Controls last for the current launch. VisualAudio's spectrum analyzers are independent.

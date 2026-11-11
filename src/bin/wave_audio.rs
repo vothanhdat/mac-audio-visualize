@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use egui::{Color32, Pos2, Rect, Stroke};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use visual_audio::{
-    audio::AudioInput,
-    waveform::{ReferenceSweep, WaveformHistory, beating_sample, tone_sample},
+    audio::{AudioInput, CaptureStall},
+    waveform::{ReferenceSweep, Trace, WaveformHistory, beating_sample, tone_sample},
 };
 use winit::{
     application::ApplicationHandler,
@@ -17,6 +17,14 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes, WindowId},
 };
+
+#[path = "wave_audio/pitch.rs"]
+mod pitch;
+use pitch::{DEFAULT_FILTER_DELAY_MS, NOTES, PitchHistory};
+
+const NOTE_WINDOW_MS: std::ops::RangeInclusive<u32> = 20..=500;
+const RAW_WAVE_COLOR: Color32 = Color32::from_rgb(84, 220, 209);
+const NOTE_CAPTURE_GRACE: Duration = Duration::from_millis(40);
 
 struct Graphics {
     surface: wgpu::Surface<'static>,
@@ -144,8 +152,43 @@ impl Graphics {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Demo {
+    Tone(f64),
+    Beats,
+    Chord,
+    Bass,
+}
+
+impl Demo {
+    fn sample(self, index: u64, sample_rate: u32) -> f32 {
+        match self {
+            Self::Tone(hz) => tone_sample(index, sample_rate, hz),
+            Self::Beats => beating_sample(index, sample_rate),
+            Self::Chord => [60, 64, 67]
+                .into_iter()
+                .map(|midi| tone_sample(index, sample_rate, pitch::frequency(midi)) / 3.0)
+                .sum(),
+            Self::Bass => {
+                let beat_samples = u64::from(sample_rate) * 3 / 4;
+                let beat = index / beat_samples;
+                let time = (index % beat_samples) as f64 / f64::from(sample_rate);
+                let envelope =
+                    (time / 0.01).clamp(0.0, 1.0) * ((0.65 - time) / 0.12).clamp(0.0, 1.0);
+                let midi = [36, 43, 45, 41][(beat % 4) as usize];
+                tone_sample(index, sample_rate, pitch::frequency(midi)) * envelope as f32
+            }
+        }
+    }
+}
+
 struct Model {
     history: WaveformHistory,
+    notes: Option<PitchHistory>,
+    lock_notes: bool,
+    note_cycles: u32,
+    note_window_ms: u32,
+    max_filter_delay_ms: u32,
     sample_rate: u32,
     min_hz: f64,
     max_hz: f64,
@@ -157,15 +200,18 @@ struct Model {
     auto_sync: bool,
     adjustment_ms: f32,
     latency_ms: Option<f32>,
-    demo: bool,
-    demo_beats: bool,
-    demo_hz: f64,
+    demo: Option<Demo>,
 }
 
 impl Model {
-    fn new(sample_rate: u32, demo: bool) -> Self {
+    fn new(sample_rate: u32, demo: Option<Demo>, sweep: bool) -> Self {
         Self {
             history: WaveformHistory::new(sample_rate),
+            notes: (!sweep).then(|| PitchHistory::new(sample_rate, 0, DEFAULT_FILTER_DELAY_MS)),
+            lock_notes: true,
+            note_cycles: 3,
+            note_window_ms: *NOTE_WINDOW_MS.end(),
+            max_filter_delay_ms: DEFAULT_FILTER_DELAY_MS,
             sample_rate,
             min_hz: 60.0_f64.min((sample_rate as f64 * 0.45).max(1.0)),
             max_hz: 6000.0_f64.min((sample_rate as f64 * 0.45).max(1.0)),
@@ -178,8 +224,24 @@ impl Model {
             adjustment_ms: 0.0,
             latency_ms: None,
             demo,
-            demo_beats: false,
-            demo_hz: 60.0,
+        }
+    }
+
+    fn ingest(&mut self, samples: &[f32]) {
+        self.history.ingest(samples);
+        if let Some(notes) = &mut self.notes {
+            notes.ingest(samples);
+        }
+    }
+
+    fn reset_history(&mut self) {
+        self.history = WaveformHistory::new(self.sample_rate);
+        if self.notes.is_some() {
+            self.notes = Some(PitchHistory::new(
+                self.sample_rate,
+                0,
+                self.max_filter_delay_ms,
+            ));
         }
     }
 
@@ -190,7 +252,7 @@ impl Model {
             return;
         }
         self.sample_rate = sample_rate;
-        self.history = WaveformHistory::new(sample_rate);
+        self.reset_history();
         let limit = (sample_rate as f64 * 0.45).min(20_000.0).max(1.0);
         self.max_hz = self.max_hz.min(limit);
         self.min_hz = self.min_hz.min(self.max_hz);
@@ -198,53 +260,127 @@ impl Model {
 
     fn ui(&mut self, context: &egui::Context) {
         let previous_channel = self.right_channel;
+        let previous_delay_limit = self.max_filter_delay_ms;
+        let mut show_notes = self.notes.is_some();
         let max_hz = (self.sample_rate as f64 * 0.45).min(20_000.0).max(1.0);
         egui::TopBottomPanel::top("controls").show(context, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("WaveAudio");
                 ui.separator();
-                if self.demo {
-                    if self.demo_beats { ui.label("Demo: 440 + 442 Hz"); }
-                    else { ui.label(format!("Demo: {:.2} Hz", self.demo_hz)); }
+                if let Some(demo) = self.demo {
+                    let label = match demo {
+                        Demo::Tone(hz) => format!("Demo: {hz:.2} Hz"),
+                        Demo::Beats => "Demo: 440 + 442 Hz".into(),
+                        Demo::Chord => "Demo: C major".into(),
+                        Demo::Bass => "Demo: bass · C2 / G2 / A2 / F2".into(),
+                    };
+                    ui.label(label);
                 } else {
                     ui.selectable_value(&mut self.right_channel, false, "Left");
                     ui.selectable_value(&mut self.right_channel, true, "Right");
                 }
+                ui.separator();
+                ui.selectable_value(&mut show_notes, true, "12 notes");
+                ui.selectable_value(&mut show_notes, false, "Time sweep");
             });
+            if !show_notes {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Reference F: Min");
+                    ui.add(
+                        egui::DragValue::new(&mut self.min_hz)
+                            .range(1.0..=max_hz)
+                            .speed(0.1)
+                            .min_decimals(2)
+                            .max_decimals(4)
+                            .suffix(" Hz"),
+                    );
+                    self.max_hz = self.max_hz.clamp(self.min_hz, max_hz);
+                    ui.label("Max");
+                    ui.add(
+                        egui::DragValue::new(&mut self.max_hz)
+                            .range(self.min_hz..=max_hz)
+                            .speed(0.1)
+                            .min_decimals(2)
+                            .max_decimals(4)
+                            .suffix(" Hz"),
+                    );
+                    ui.checkbox(&mut self.logarithmic, "Log spacing");
+                });
+            }
             ui.horizontal_wrapped(|ui| {
-                ui.label("Reference F: Min");
-                ui.add(egui::DragValue::new(&mut self.min_hz).range(1.0..=max_hz).speed(0.1).min_decimals(2).max_decimals(4).suffix(" Hz"));
-                self.max_hz = self.max_hz.clamp(self.min_hz, max_hz);
-                ui.label("Max");
-                ui.add(egui::DragValue::new(&mut self.max_hz).range(self.min_hz..=max_hz).speed(0.1).min_decimals(2).max_decimals(4).suffix(" Hz"));
-                ui.checkbox(&mut self.logarithmic, "Log spacing");
+                if show_notes {
+                    ui.checkbox(&mut self.lock_notes, "Phase lock");
+                    if self.lock_notes {
+                        ui.add(egui::Slider::new(&mut self.note_cycles, 1..=12).text("Cycles"));
+                    } else {
+                        ui.add(
+                            egui::Slider::new(&mut self.note_window_ms, NOTE_WINDOW_MS)
+                                .suffix(" ms")
+                                .text("Time window"),
+                        );
+                    }
+                } else {
+                    ui.checkbox(&mut self.phase_lock, "Lock phase to Min")
+                        .on_hover_text("Align the shared read endpoint to the Min period.");
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.gain, 0.1..=10.0)
+                        .logarithmic(true)
+                        .text("gain"),
+                );
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.phase_lock, "Lock phase to Min")
-                    .on_hover_text("Use one shared read endpoint aligned to the Min period. Individual points use F(x) only for their delay, keeping the curve continuous. This does not lock every frequency at once.");
-                ui.add(egui::Slider::new(&mut self.gain, 0.1..=10.0).logarithmic(true).text("gain"));
-            });
+            if show_notes {
+                ui.add(
+                    egui::Slider::new(&mut self.max_filter_delay_ms, 60..=250)
+                        .suffix(" ms")
+                        .text("Max filter delay"),
+                )
+                .on_hover_text("Lower values speed up bass response and allow more spill between neighboring notes.");
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Target FPS");
-                ui.add(egui::DragValue::new(&mut self.target_fps).range(30..=240).speed(1.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.target_fps)
+                        .range(30..=240)
+                        .speed(1.0),
+                );
                 ui.small("Actual presentation depends on the display; audio time sets the window.");
             });
-            if !self.demo {
+            if self.demo.is_none() {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.auto_sync, "Follow output delay");
-                    ui.add(egui::Slider::new(&mut self.adjustment_ms, -500.0..=1000.0).text("adjustment (ms)"));
+                    ui.add(
+                        egui::Slider::new(&mut self.adjustment_ms, -500.0..=1000.0)
+                            .text("adjustment (ms)"),
+                    );
                     match self.latency_ms {
-                        Some(ms) => { ui.label(format!("Output: {ms:.0} ms")); }
-                        None => { ui.label("Output delay unavailable"); }
+                        Some(ms) => {
+                            ui.label(format!("Output: {ms:.0} ms"));
+                        }
+                        None => {
+                            ui.label("Output delay unavailable");
+                        }
                     }
                 });
             }
-            ui.small("One line: Reference F increases from Min at left to Max at right. All points read the same raw audio.");
         });
         if self.right_channel != previous_channel {
-            self.history = WaveformHistory::new(self.sample_rate);
+            self.reset_history();
         }
-        let delay_ms = if self.demo {
+        if show_notes != self.notes.is_some() {
+            self.notes = show_notes.then(|| {
+                PitchHistory::new(
+                    self.sample_rate,
+                    self.history.sample_count,
+                    self.max_filter_delay_ms,
+                )
+            });
+        } else if previous_delay_limit != self.max_filter_delay_ms
+            && let Some(notes) = &mut self.notes
+        {
+            notes.set_delay_limit(self.sample_rate, self.max_filter_delay_ms);
+        }
+        let delay_ms = if self.demo.is_some() {
             0.0
         } else {
             ((if self.auto_sync {
@@ -258,6 +394,10 @@ impl Model {
             - 1.0
             - delay_ms as f64 * self.sample_rate as f64 / 1000.0;
         egui::CentralPanel::default().show(context, |ui| {
+            if let Some(notes) = &self.notes {
+                self.note_plot(ui, notes, available_end);
+                return;
+            }
             let height = (ui.available_height() - 24.0).max(30.0);
             let sweep = self.history.sweep(
                 available_end,
@@ -273,6 +413,106 @@ impl Model {
                 "Continuous scrolling / same audio, varying timebase / newest at right"
             });
         });
+    }
+
+    fn note_plot(&self, ui: &mut egui::Ui, notes: &PitchHistory, end: f64) {
+        let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, Color32::from_rgb(13, 20, 30));
+        let left = rect.left() + 44.0;
+        let right = rect.right() - 10.0;
+        let top = rect.top() + 8.0;
+        let bottom = rect.bottom() - 23.0;
+        let width = right - left;
+        let height = bottom - top;
+        if width < 1.0 || height < 1.0 {
+            return;
+        }
+
+        let lane_height = height / NOTES.len() as f32;
+        let label = egui::FontId::proportional(11.0);
+        for note in 0..NOTES.len() {
+            if note % 2 == 0 {
+                let y = top + note as f32 * lane_height;
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, y + lane_height)),
+                    0.0,
+                    Color32::from_rgb(17, 27, 39),
+                );
+            }
+        }
+        for step in 0..=4 {
+            let fraction = f64::from(step) / 4.0;
+            let x = left + width * fraction as f32;
+            painter.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, bottom)],
+                Stroke::new(0.5, Color32::from_gray(49)),
+            );
+            let align = match step {
+                0 => egui::Align2::LEFT_BOTTOM,
+                4 => egui::Align2::RIGHT_BOTTOM,
+                _ => egui::Align2::CENTER_BOTTOM,
+            };
+            let text = if step == 4 {
+                if self.lock_notes { "Trigger" } else { "Now" }.to_owned()
+            } else if self.lock_notes {
+                let cycles = (1.0 - fraction) * f64::from(self.note_cycles);
+                format!("−{cycles} cycles")
+            } else {
+                let age_ms = (1.0 - fraction) * f64::from(self.note_window_ms);
+                format!("−{age_ms} ms")
+            };
+            painter.text(
+                Pos2::new(x, rect.bottom() - 4.0),
+                align,
+                text,
+                label.clone(),
+                Color32::GRAY,
+            );
+        }
+
+        let sample_rate = f64::from(self.sample_rate);
+        let shared_span = f64::from(self.note_window_ms) * sample_rate / 1000.0;
+        let frame = if self.lock_notes {
+            notes.frame_at(end)
+        } else {
+            Default::default()
+        };
+        for (note, name) in NOTES.iter().enumerate() {
+            let lane_top = top + note as f32 * lane_height;
+            let lane = Rect::from_min_max(
+                Pos2::new(left, lane_top),
+                Pos2::new(right, lane_top + lane_height),
+            );
+            let color: Color32 =
+                egui::ecolor::Hsva::new(note as f32 / 12.0, 0.56, 0.94, 1.0).into();
+            let trigger = frame.triggers[note];
+            let lane_end = trigger.map_or(end, |trigger| trigger.end);
+            let span = if self.lock_notes {
+                let period = trigger.map_or_else(
+                    || sample_rate / pitch::frequency(60 + note as u8),
+                    |trigger| trigger.period,
+                );
+                period * f64::from(self.note_cycles)
+            } else {
+                shared_span
+            };
+            let name = trigger.map_or_else(
+                || (*name).to_owned(),
+                |trigger| format!("{name}{}", trigger.midi / 12 - 1),
+            );
+            painter.text(
+                Pos2::new(left - 8.0, lane.center().y),
+                egui::Align2::RIGHT_CENTER,
+                name,
+                label.clone(),
+                color,
+            );
+            let trace = (!frame.silent).then(|| notes.trace(note));
+            self.draw_trace(&painter, lane, trace, color, |u| {
+                lane_end - (1.0 - u) * span
+            });
+        }
     }
 
     fn wave(&self, ui: &mut egui::Ui, sweep: ReferenceSweep, height: f32) {
@@ -316,6 +556,23 @@ impl Model {
                 Color32::from_gray(160),
             );
         }
+        self.draw_trace(
+            &painter,
+            plot,
+            Some(&self.history.raw),
+            RAW_WAVE_COLOR,
+            |u| sweep.sample_position(u),
+        );
+    }
+
+    fn draw_trace(
+        &self,
+        painter: &egui::Painter,
+        plot: Rect,
+        trace: Option<&Trace>,
+        color: Color32,
+        position_at: impl Fn(f64) -> f64,
+    ) {
         painter.line_segment(
             [
                 Pos2::new(plot.left(), plot.center().y),
@@ -323,16 +580,18 @@ impl Model {
             ],
             Stroke::new(0.5, Color32::from_gray(65)),
         );
+        let Some(trace) = trace else {
+            return;
+        };
         let painter = painter.with_clip_rect(plot);
         let columns = plot.width().ceil().clamp(1.0, 1800.0) as usize;
         let scale = plot.height() * 0.44 * self.gain;
         let y = |value: f32| plot.center().y - value * scale;
-        let color = Color32::from_rgb(84, 220, 209);
-        let mut line = Vec::new();
+        let mut line = Vec::with_capacity(columns + 1);
         for point in 0..=columns {
             let fraction = point as f64 / columns as f64;
-            let position = sweep.sample_position(fraction);
-            if let Some(value) = self.history.raw.interpolate(position) {
+            let position = position_at(fraction);
+            if let Some(value) = trace.interpolate(position) {
                 let x = plot.left() + plot.width() * fraction as f32;
                 line.push(Pos2::new(x, y(value)));
             } else if line.len() > 1 {
@@ -343,17 +602,17 @@ impl Model {
             } else {
                 line.clear();
             }
-            if point < columns {
-                let next = sweep.sample_position((point + 1) as f64 / columns as f64);
-                if next - position > 1.0 {
-                    if let Some((low, high)) = self.history.raw.segment_range(position, next) {
-                        let x = plot.left() + plot.width() * fraction as f32;
-                        painter.line_segment(
-                            [Pos2::new(x, y(low)), Pos2::new(x, y(high))],
-                            Stroke::new(1.0, color),
-                        );
-                    }
-                }
+            let next = position_at((point + 1) as f64 / columns as f64);
+            if point < columns
+                && next - position > 1.0
+                && let Some((low, high)) = trace.segment_range(position, next)
+                && low < high
+            {
+                let x = plot.left() + plot.width() * fraction as f32;
+                painter.line_segment(
+                    [Pos2::new(x, y(low)), Pos2::new(x, y(high))],
+                    Stroke::new(1.0, color),
+                );
             }
         }
         if line.len() > 1 {
@@ -364,6 +623,7 @@ impl Model {
 
 struct App {
     audio: Option<AudioInput>,
+    capture_stall: CaptureStall,
     model: Model,
     left: Vec<f32>,
     right: Vec<f32>,
@@ -381,14 +641,32 @@ impl App {
             self.model.latency_ms = audio.output_latency_ms();
             if let Some(sample_rate) = audio.ring.take_sample_rate_change() {
                 self.model.set_sample_rate(sample_rate);
+                self.capture_stall =
+                    CaptureStall::with_grace_period(Instant::now(), NOTE_CAPTURE_GRACE);
             }
             let count = audio.ring.drain_latest(&mut self.left, &mut self.right);
+            let history_samples = 4 * u64::from(self.model.sample_rate);
+            let remaining = history_samples.saturating_sub(self.capture_stall.filled()) as usize;
+            let silent = self.capture_stall.silent_samples(
+                count,
+                Instant::now(),
+                self.model.sample_rate as f32,
+            );
             let samples = if self.model.right_channel {
                 &self.right
             } else {
                 &self.left
             };
-            self.model.history.ingest(&samples[samples.len() - count..]);
+            self.model.ingest(&samples[samples.len() - count..]);
+            if self.model.notes.is_some() {
+                let mut silent = silent.min(remaining);
+                while silent > 0 {
+                    let chunk = silent.min(self.left.len());
+                    self.left[..chunk].fill(0.0);
+                    self.model.ingest(&self.left[..chunk]);
+                    silent -= chunk;
+                }
+            }
         } else {
             let target =
                 (self.demo_started.elapsed().as_secs_f64() * self.model.sample_rate as f64) as u64;
@@ -398,18 +676,14 @@ impl App {
                 .max(target.saturating_sub(self.left.len() as u64));
             let count = target.saturating_sub(self.demo_index) as usize;
             for (offset, sample) in self.left[..count].iter_mut().enumerate() {
-                *sample = if self.model.demo_beats {
-                    beating_sample(self.demo_index + offset as u64, self.model.sample_rate)
-                } else {
-                    tone_sample(
-                        self.demo_index + offset as u64,
-                        self.model.sample_rate,
-                        self.model.demo_hz,
-                    )
-                };
+                *sample = self
+                    .model
+                    .demo
+                    .unwrap()
+                    .sample(self.demo_index + offset as u64, self.model.sample_rate);
             }
             self.demo_index = target;
-            self.model.history.ingest(&self.left[..count]);
+            self.model.ingest(&self.left[..count]);
         }
     }
 }
@@ -421,8 +695,8 @@ impl ApplicationHandler for App {
         }
         let window = match event_loop.create_window(
             WindowAttributes::default()
-                .with_title(if self.model.demo {
-                    "WaveAudio — Timebase demo"
+                .with_title(if self.model.demo.is_some() {
+                    "WaveAudio — Demo"
                 } else {
                     "WaveAudio — Live audio"
                 })
@@ -508,31 +782,30 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<()> {
-    let mut demo = false;
-    let mut demo_beats = false;
-    let mut demo_hz = 60.0_f64;
+    let mut demo = None;
+    let mut sweep = false;
     let mut min_hz: Option<f64> = None;
     let mut max_hz: Option<f64> = None;
     let mut device = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--demo" => demo = true,
-            "--demo-beats" => {
-                demo = true;
-                demo_beats = true;
-            }
+            "--demo" => demo = Some(Demo::Tone(60.0)),
+            "--demo-beats" => demo = Some(Demo::Beats),
+            "--demo-chord" => demo = Some(Demo::Chord),
+            "--demo-bass" => demo = Some(Demo::Bass),
+            "--sweep" => sweep = true,
             "--demo-tone" => {
-                demo = true;
-                demo_hz = args
+                let hz: f64 = args
                     .next()
                     .context("--demo-tone needs a frequency")?
                     .parse()
                     .context("invalid demo frequency")?;
                 anyhow::ensure!(
-                    demo_hz.is_finite() && (1.0..=20_000.0).contains(&demo_hz),
+                    hz.is_finite() && (1.0..=20_000.0).contains(&hz),
                     "demo frequency must be 1–20000 Hz"
                 );
+                demo = Some(Demo::Tone(hz));
             }
             "--min-hz" => {
                 min_hz = Some(
@@ -553,7 +826,7 @@ fn main() -> Result<()> {
             "--device" => device = Some(args.next().context("--device needs a name fragment")?),
             "--help" | "-h" => {
                 println!(
-                    "wave-audio [--demo | --demo-tone HZ | --demo-beats | --device NAME] [--min-hz HZ] [--max-hz HZ]\n\nDefault: native system audio capture (macOS 14.2+).\n--demo: silent visual test with a pure 60 Hz tone.\n--demo-tone HZ: visual test with a chosen pure tone.\n--demo-beats: visual test with 440 + 442 Hz.\n--min-hz / --max-hz: reference frequency range along one curve.\nDefault: Min=60 Hz, Max=6000 Hz, log spacing, continuous scrolling, target 120 FPS.\nEach x reads audio(t_anchor - (1-u) / F(u)), with u from left to right.\nVisualAudio settings are not changed."
+                    "wave-audio [--device NAME | --demo | --demo-tone HZ | --demo-chord | --demo-bass | --demo-beats]\n           [--sweep] [--min-hz HZ] [--max-hz HZ]\n\nDefault: 12 filtered waveforms using native macOS audio capture.\nDemos are silent. --demo uses 60 Hz, --demo-chord uses C major, and --demo-bass loops a low phrase.\n--sweep opens the variable-timebase waveform. --min-hz / --max-hz imply --sweep."
                 );
                 return Ok(());
             }
@@ -561,10 +834,10 @@ fn main() -> Result<()> {
         }
     }
     anyhow::ensure!(
-        !(demo && device.is_some()),
+        !(demo.is_some() && device.is_some()),
         "choose a demo or --device, not both"
     );
-    let audio = if demo {
+    let audio = if demo.is_some() {
         None
     } else {
         Some(match device {
@@ -573,13 +846,17 @@ fn main() -> Result<()> {
         })
     };
     let sample_rate = audio.as_ref().map_or(48_000, AudioInput::sample_rate);
-    let mut model = Model::new(sample_rate, demo);
-    model.demo_beats = demo_beats;
-    model.demo_hz = demo_hz;
-    if demo {
-        model.min_hz = if demo_beats { 440.0 } else { demo_hz };
-        model.max_hz = model.max_hz.max(model.min_hz);
-    }
+    let mut model = Model::new(
+        sample_rate,
+        demo,
+        sweep || min_hz.is_some() || max_hz.is_some(),
+    );
+    model.min_hz = match demo {
+        Some(Demo::Tone(hz)) => hz,
+        Some(Demo::Beats) => 440.0,
+        _ => model.min_hz,
+    };
+    model.max_hz = model.max_hz.max(model.min_hz);
     if let Some(value) = min_hz {
         model.min_hz = value;
     }
@@ -598,6 +875,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut App {
         audio,
+        capture_stall: CaptureStall::with_grace_period(Instant::now(), NOTE_CAPTURE_GRACE),
         model,
         left: vec![0.0; 131_072],
         right: vec![0.0; 131_072],
@@ -609,4 +887,37 @@ fn main() -> Result<()> {
         minimized: false,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bass_demo_moves_through_the_expected_lanes() {
+        let sample_rate = 48_000;
+        let mut history = PitchHistory::new(sample_rate, 0, DEFAULT_FILTER_DELAY_MS);
+        let mut start = 0;
+        for (step, expected) in [0, 7, 9, 5].into_iter().enumerate() {
+            let end = step as u64 * 36_000 + 28_800;
+            let samples: Vec<_> = (start..end)
+                .map(|index| Demo::Bass.sample(index, sample_rate))
+                .collect();
+            history.ingest(&samples);
+            let peaks: [f32; 12] = std::array::from_fn(|note| {
+                let (low, high) = history
+                    .trace(note)
+                    .segment_range((end - 960) as f64, (end - 1) as f64)
+                    .unwrap();
+                low.abs().max(high.abs())
+            });
+            assert!(peaks[expected] > 0.35, "{peaks:?}");
+            for (note, peak) in peaks.into_iter().enumerate() {
+                if note != expected {
+                    assert!(peak < peaks[expected] * 0.55, "{peaks:?}");
+                }
+            }
+            start = end;
+        }
+    }
 }

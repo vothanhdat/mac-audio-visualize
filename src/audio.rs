@@ -142,32 +142,39 @@ pub const MAX_STALL_SILENCE: Duration = Duration::from_secs(10);
 
 /// System capture delivers no samples at all while no app plays, and none
 /// while it restarts after an output change. Analyzers hold their last levels
-/// on frames without new samples, so once a stall outlasts `CAPTURE_STALL`
+/// on frames without new samples, so once a stall outlasts the grace period,
 /// its remaining time is filled with silence and levels decay, instead of
 /// freezing when capture stops mid-sound.
 #[derive(Debug)]
 pub struct CaptureStall {
     last_samples: Instant,
     filled: u64,
+    grace_period: Duration,
 }
 
 impl CaptureStall {
     pub fn new(now: Instant) -> Self {
+        Self::with_grace_period(now, CAPTURE_STALL)
+    }
+
+    pub fn with_grace_period(now: Instant, grace_period: Duration) -> Self {
         Self {
             last_samples: now,
             filled: 0,
+            grace_period,
         }
     }
 
     /// Silent samples to append after a drain that returned `drained` samples.
     pub fn silent_samples(&mut self, drained: usize, now: Instant, sample_rate: f32) -> usize {
         if drained > 0 {
-            *self = Self::new(now);
+            self.last_samples = now;
+            self.filled = 0;
             return 0;
         }
         let Some(stalled) = now
             .saturating_duration_since(self.last_samples)
-            .checked_sub(CAPTURE_STALL)
+            .checked_sub(self.grace_period)
         else {
             return 0;
         };

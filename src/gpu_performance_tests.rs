@@ -106,6 +106,7 @@ fn gpu_bar_width_cost_breakdown() {
                         axis_labels_overlay: f32::from(settings.axis_labels_overlay),
                         axis_label_mode: settings.axis_label_mode.shader_value(),
                         show_frequency_grid: f32::from(settings.show_frequency_grid),
+                        palette: shader_palette(&settings),
                         ..bytemuck::Zeroable::zeroed()
                     };
                     queue.write_buffer(
@@ -492,6 +493,7 @@ fn gpu_bar_render_optimization_preserves_pixels() {
                                 mirror_baseline_percent: settings.mirror_baseline_percent,
                                 mirror_initial_fade_percent: settings.mirror_initial_fade_percent,
                                 mirror_fade_percent: settings.mirror_fade_percent,
+                                palette: shader_palette(&settings),
                                 ..bytemuck::Zeroable::zeroed()
                             };
                             queue.write_buffer(

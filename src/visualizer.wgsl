@@ -29,6 +29,8 @@ struct RenderChannelParams {
     _padding_0: f32,
     _padding_1: f32,
     _padding_2: f32,
+    // Linear-light low, middle and high colors; alpha is unused.
+    palette: array<vec4<f32>, 3>,
 }
 
 @group(0) @binding(7) var<storage, read> spectrum: array<vec4<f32>>;
@@ -503,11 +505,17 @@ struct FlatBarOut {
     @location(2) reflection_alpha: f32,
 }
 
+// The selected palette blended across the frequency axis: low to middle over
+// the lower half, middle to high above it.
+fn palette_color(bin_t: f32) -> vec3<f32> {
+    let low = render_channel.palette[0].rgb;
+    let middle = render_channel.palette[1].rgb;
+    let high = render_channel.palette[2].rgb;
+    return mix(mix(low, middle, min(bin_t * 2.0, 1.0)), high, max(bin_t * 2.0 - 1.0, 0.0));
+}
+
 fn flat_bar_light(bin_t: f32, energy: f32, response: f32) -> vec3<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(mix(low, middle, min(bin_t * 2.0, 1.0)), high, max(bin_t * 2.0 - 1.0, 0.0));
+    let frequency_color = palette_color(bin_t);
     let white_hot = smoothstep(0.70, 1.0, energy) * 0.88;
     let onset = response * params.frequency_range.w;
     let transient_white = clamp(onset * 0.10, 0.0, 0.12);
@@ -542,10 +550,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 }
 
 fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(mix(low, middle, min(in.bin_t * 2.0, 1.0)), high, max(in.bin_t * 2.0 - 1.0, 0.0));
+    let frequency_color = palette_color(in.bin_t);
     let white_hot = smoothstep(0.70, 1.0, in.energy) * 0.88;
     let onset = in.transient * params.frequency_range.w;
     let transient_white = clamp(onset * 0.10, 0.0, 0.12);
@@ -640,14 +645,7 @@ fn prism_fs(in: BarOut) -> @location(0) vec4<f32> {
     if (in.energy <= 0.0001) {
         discard;
     }
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(
-        mix(low, middle, min(in.bin_t * 2.0, 1.0)),
-        high,
-        max(in.bin_t * 2.0 - 1.0, 0.0),
-    );
+    let frequency_color = palette_color(in.bin_t);
     let white_hot = smoothstep(0.70, 1.0, in.energy) * 0.88;
     let onset = in.transient * params.frequency_range.w;
     let transient_white = clamp(onset * 0.10, 0.0, 0.12);
@@ -713,10 +711,7 @@ fn glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 
 @fragment
 fn glow_fs(in: BarOut) -> @location(0) vec4<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(mix(low, middle, min(in.bin_t * 2.0, 1.0)), high, max(in.bin_t * 2.0 - 1.0, 0.0));
+    let frequency_color = palette_color(in.bin_t);
     let horizontal = pow(max(1.0 - abs(in.uv.x * 2.0 - 1.0), 0.0), 3.0);
     let onset = in.transient * params.frequency_range.w;
     let strength = horizontal * smoothstep(0.45, 1.0, in.energy) *
@@ -812,10 +807,7 @@ fn peak_volume_vs(
 
 @fragment
 fn peak_fs(in: BarOut) -> @location(0) vec4<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let color = mix(mix(low, middle, min(in.bin_t * 2.0, 1.0)), high, max(in.bin_t * 2.0 - 1.0, 0.0));
+    let color = palette_color(in.bin_t);
     let onset = in.response * params.frequency_range.w;
     let hot_color = mix(color, vec3(1.0), clamp(onset * 0.18, 0.0, 0.16));
     return vec4(
@@ -862,10 +854,7 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
 
 @fragment
 fn peak_glow_fs(in: BarOut) -> @location(0) vec4<f32> {
-    let low = vec3(0.08, 0.40, 1.0);
-    let middle = vec3(0.02, 0.95, 0.78);
-    let high = vec3(1.0, 0.20, 0.58);
-    let frequency_color = mix(mix(low, middle, min(in.bin_t * 2.0, 1.0)), high, max(in.bin_t * 2.0 - 1.0, 0.0));
+    let frequency_color = palette_color(in.bin_t);
     let centered = abs(in.uv * 2.0 - vec2(1.0));
     let halo = pow(max(1.0 - length(centered), 0.0), 2.0);
     let onset = in.response * params.frequency_range.w;

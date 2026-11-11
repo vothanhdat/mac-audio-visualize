@@ -154,6 +154,14 @@ two-stage resonators, and transient assistance have been removed. Old DFT
 profiles migrate to the resonator bank; obsolete fields are ignored when loading
 and omitted on the next settings save. Other saved settings are retained.
 
+**UI → Colors** sets the spectrum's low → mid → high frequency gradient, used by
+bars, peaks, glows, and 3D faces. Choose **Default** (blue → teal → pink),
+**Fire**, **Ocean**, **Sunset**, **Forest**, **Monochrome**, or **Custom**, which
+shows three color pickers for low, mid, and high. A strip beneath the menu
+previews the gradient. Loud bars still blend toward white. Custom colors are
+kept when you switch to a preset and back, and the choice is saved; **Reset
+defaults** restores the Default palette. The note ribbon keeps its own colors.
+
 The **UI → Show note activity at top** toggle displays a C–B ribbon above the
 spectrum (enabled by default). **Note ribbon width** adjusts its centered span
 from 20% to 100% of the window width; the default is 76%, and the choice is saved.

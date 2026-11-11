@@ -85,6 +85,8 @@ struct RenderChannelParams {
     _padding_0: f32,
     _padding_1: f32,
     _padding_2: f32,
+    /// Linear-light low, middle and high spectrum colors; alpha is unused.
+    palette: [[f32; 4]; 3],
 }
 
 #[repr(C)]
@@ -217,6 +219,102 @@ struct VisualizerSettings {
     frequency_focus_strength_percent: f32,
     frequency_focus_origin_percent: f32,
     transparent_background: bool,
+    spectrum_palette: SpectrumPalette,
+    /// sRGB low, middle and high colors used when the palette is Custom.
+    custom_palette_srgb: [[u8; 3]; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum SpectrumPalette {
+    Default,
+    Fire,
+    Ocean,
+    Sunset,
+    Forest,
+    Monochrome,
+    Custom,
+}
+
+impl SpectrumPalette {
+    const ALL: [Self; 7] = [
+        Self::Default,
+        Self::Fire,
+        Self::Ocean,
+        Self::Sunset,
+        Self::Forest,
+        Self::Monochrome,
+        Self::Custom,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Fire => "Fire",
+            Self::Ocean => "Ocean",
+            Self::Sunset => "Sunset",
+            Self::Forest => "Forest",
+            Self::Monochrome => "Monochrome",
+            Self::Custom => "Custom",
+        }
+    }
+
+    /// Linear-light low, middle and high colors of a built-in palette.
+    fn preset_colors(self) -> Option<[[f32; 3]; 3]> {
+        Some(match self {
+            Self::Default => [[0.08, 0.40, 1.0], [0.02, 0.95, 0.78], [1.0, 0.20, 0.58]],
+            Self::Fire => [[0.80, 0.03, 0.02], [1.0, 0.32, 0.0], [1.0, 0.82, 0.18]],
+            Self::Ocean => [[0.02, 0.08, 0.90], [0.0, 0.50, 1.0], [0.30, 1.0, 0.92]],
+            Self::Sunset => [[0.42, 0.04, 0.90], [1.0, 0.12, 0.38], [1.0, 0.58, 0.08]],
+            Self::Forest => [[0.0, 0.40, 0.16], [0.22, 0.88, 0.08], [0.85, 1.0, 0.14]],
+            Self::Monochrome => [[0.68, 0.76, 0.90]; 3],
+            Self::Custom => return None,
+        })
+    }
+}
+
+fn srgb_palette(linear: [[f32; 3]; 3]) -> [[u8; 3]; 3] {
+    linear.map(|color| color.map(egui::ecolor::gamma_u8_from_linear_f32))
+}
+
+/// Linear-light colors for the selected palette, padded for the shader.
+fn shader_palette(settings: &VisualizerSettings) -> [[f32; 4]; 3] {
+    let colors = settings
+        .spectrum_palette
+        .preset_colors()
+        .unwrap_or_else(|| {
+            settings
+                .custom_palette_srgb
+                .map(|color| color.map(egui::ecolor::linear_f32_from_gamma_u8))
+        });
+    colors.map(|[r, g, b]| [r, g, b, 0.0])
+}
+
+/// A strip showing the palette blended across the frequency axis as the
+/// shader does: low to middle over the lower half, middle to high above it.
+fn palette_preview(ui: &mut egui::Ui, settings: &VisualizerSettings) {
+    const SLICES: usize = 64;
+    let width = ui.available_width().min(240.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
+    let [low, middle, high] = shader_palette(settings);
+    let mix = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] {
+        std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+    };
+    let painter = ui.painter_at(rect);
+    for slice in 0..SLICES {
+        let t = (slice as f32 + 0.5) / SLICES as f32;
+        let [r, g, b, _] = mix(
+            mix(low, middle, (t * 2.0).min(1.0)),
+            high,
+            (t * 2.0 - 1.0).max(0.0),
+        );
+        let left = rect.left() + rect.width() * slice as f32 / SLICES as f32;
+        let right = rect.left() + rect.width() * (slice + 1) as f32 / SLICES as f32;
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(left..=right + 0.5, rect.y_range()),
+            0.0,
+            egui::Color32::from(egui::Rgba::from_rgb(r, g, b)),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +626,10 @@ impl Default for VisualizerSettings {
             frequency_focus_strength_percent: 59.0,
             frequency_focus_origin_percent: 50.0,
             transparent_background: false,
+            spectrum_palette: SpectrumPalette::Default,
+            custom_palette_srgb: srgb_palette(
+                SpectrumPalette::Default.preset_colors().unwrap(),
+            ),
         }
     }
 }
@@ -1858,6 +1960,30 @@ fn draw_settings_panel(
                 });
                 ui.separator();
                 ui.label("Bar appearance");
+                egui::ComboBox::from_label("Colors")
+                    .selected_text(settings.spectrum_palette.label())
+                    .show_ui(ui, |ui| {
+                        for palette in SpectrumPalette::ALL {
+                            ui.selectable_value(
+                                &mut settings.spectrum_palette,
+                                palette,
+                                palette.label(),
+                            );
+                        }
+                    });
+                if settings.spectrum_palette == SpectrumPalette::Custom {
+                    ui.horizontal(|ui| {
+                        for (color, label) in settings
+                            .custom_palette_srgb
+                            .iter_mut()
+                            .zip(["Low", "Mid", "High"])
+                        {
+                            ui.color_edit_button_srgb(color);
+                            ui.label(label);
+                        }
+                    });
+                }
+                palette_preview(ui, settings);
                 egui::ComboBox::from_label("Render mode")
                     .selected_text(settings.render_mode.label())
                     .show_ui(ui, |ui| {
@@ -3648,6 +3774,7 @@ impl GpuState {
                     _padding_0: 0.0,
                     _padding_1: 0.0,
                     _padding_2: 0.0,
+                    palette: shader_palette(&self.settings),
                 }),
             );
         }
@@ -4751,6 +4878,7 @@ fn create_analyzer_channel(
             _padding_0: 0.0,
             _padding_1: 0.0,
             _padding_2: 0.0,
+            palette: shader_palette(settings),
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -5378,6 +5506,51 @@ mod tests {
         let json = serde_json::to_string(&expected).unwrap();
         let actual: VisualizerSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn spectrum_palette_defaults_and_custom_colors() {
+        // Settings saved before the palette option keep the original colors.
+        let old: VisualizerSettings = serde_json::from_str(r#"{"gain":2.0}"#).unwrap();
+        assert_eq!(old.spectrum_palette, SpectrumPalette::Default);
+        assert_eq!(
+            shader_palette(&old),
+            [
+                [0.08, 0.40, 1.0, 0.0],
+                [0.02, 0.95, 0.78, 0.0],
+                [1.0, 0.20, 0.58, 0.0],
+            ]
+        );
+        // Custom starts from the default colors, within 8-bit sRGB rounding.
+        let custom = VisualizerSettings {
+            spectrum_palette: SpectrumPalette::Custom,
+            ..old.clone()
+        };
+        for (custom, default) in shader_palette(&custom)
+            .iter()
+            .flatten()
+            .zip(shader_palette(&old).iter().flatten())
+        {
+            assert!((custom - default).abs() < 0.005, "{custom} vs {default}");
+        }
+        let red = VisualizerSettings {
+            custom_palette_srgb: [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            ..custom
+        };
+        assert_eq!(
+            shader_palette(&red),
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ]
+        );
+        let json = serde_json::to_value(&red).unwrap();
+        assert_eq!(json["spectrum_palette"], "Custom");
+        assert_eq!(json["custom_palette_srgb"][0], serde_json::json!([255, 0, 0]));
+        for palette in SpectrumPalette::ALL {
+            assert_eq!(palette.preset_colors().is_none(), palette == SpectrumPalette::Custom);
+        }
     }
 
     #[test]

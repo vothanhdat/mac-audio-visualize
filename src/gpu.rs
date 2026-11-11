@@ -82,12 +82,12 @@ struct RenderChannelParams {
     bar_depth_pixels: f32,
     peak_depth_brightness_percent: f32,
     volume_stage_count: f32,
-    _padding_0: f32,
+    /// PaletteBlend::shader_value().
+    palette_blend: f32,
     _padding_1: f32,
     _padding_2: f32,
-    /// Spectrum color stops in position order: linear color in rgb and
-    /// position across the frequency axis (0 to 1) in w.
-    palette: [[f32; 4]; PALETTE_STOPS],
+    /// Palette segments from shader_palette().
+    palette: [[f32; 4]; 2 * PALETTE_SEGMENTS],
 }
 
 #[repr(C)]
@@ -221,6 +221,7 @@ struct VisualizerSettings {
     frequency_focus_origin_percent: f32,
     transparent_background: bool,
     spectrum_palette: SpectrumPalette,
+    palette_blend: PaletteBlend,
     /// Stops used when the palette is Custom, in any order.
     custom_palette: [ColorStop; PALETTE_STOPS],
     /// Read only to migrate three-color custom palettes; never saved.
@@ -319,37 +320,144 @@ impl SpectrumPalette {
     }
 }
 
-/// The selected palette's stops in position order, as linear color in rgb
-/// and position (0 to 1) in w.
-fn shader_palette(settings: &VisualizerSettings) -> [[f32; 4]; PALETTE_STOPS] {
+/// How colors change between neighboring stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum PaletteBlend {
+    /// Mix linear red, green and blue.
+    Rgb,
+    /// Mix hue, saturation and lightness of the sRGB colors.
+    Hsl,
+}
+
+impl PaletteBlend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rgb => "RGB",
+            Self::Hsl => "Hue, saturation, lightness",
+        }
+    }
+
+    fn shader_value(self) -> f32 {
+        match self {
+            Self::Rgb => 0.0,
+            Self::Hsl => 1.0,
+        }
+    }
+}
+
+const PALETTE_SEGMENTS: usize = PALETTE_STOPS - 1;
+
+/// Each segment between neighboring stops (in position order) as a start and
+/// an end. xyz is linear RGB, or for HSL blending the hue in turns,
+/// saturation and lightness; w is the position (0 to 1).
+fn shader_palette(settings: &VisualizerSettings) -> [[f32; 4]; 2 * PALETTE_SEGMENTS] {
     let mut stops = settings
         .spectrum_palette
         .preset_stops()
         .unwrap_or_else(|| settings.custom_palette.map(ColorStop::linear));
     // Stable, so stops at the same position keep their order: a hard edge.
     stops.sort_by(|a, b| a.1.total_cmp(&b.1));
-    stops.map(|([r, g, b], position)| [r, g, b, (position / 100.0).clamp(0.0, 1.0)])
+    let mut segments = [[0.0; 4]; 2 * PALETTE_SEGMENTS];
+    for (index, pair) in stops.windows(2).enumerate() {
+        let ((start, start_position), (end, end_position)) = (pair[0], pair[1]);
+        let (start, end) = match settings.palette_blend {
+            PaletteBlend::Rgb => (start, end),
+            PaletteBlend::Hsl => hsl_segment(start, end),
+        };
+        let point = |[x, y, z]: [f32; 3], position: f32| [x, y, z, (position / 100.0).clamp(0.0, 1.0)];
+        segments[2 * index] = point(start, start_position);
+        segments[2 * index + 1] = point(end, end_position);
+    }
+    segments
 }
 
-/// The shader's palette_color(): blend between neighboring stops, and hold
-/// the first and last colors beyond them.
-fn palette_color(stops: &[[f32; 4]; PALETTE_STOPS], t: f32) -> [f32; 3] {
-    let mut color = [stops[0][0], stops[0][1], stops[0][2]];
-    for pair in stops.windows(2) {
-        let (previous, next) = (pair[0], pair[1]);
-        let span = next[3] - previous[3];
-        let amount = if span > 0.0 {
-            ((t - previous[3]) / span).clamp(0.0, 1.0)
-        } else if t >= next[3] {
-            1.0
-        } else {
-            0.0
-        };
-        for (channel, target) in color.iter_mut().zip(next) {
-            *channel += (target - *channel) * amount;
+/// Hue, saturation and lightness for the ends of one segment. A gray end
+/// takes the other end's hue, so only saturation and lightness change toward
+/// it, and the hue takes the shorter way around the color wheel.
+fn hsl_segment(start: [f32; 3], end: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let (start_hue, start_saturation, start_lightness) = hsl_from_srgb(start.map(srgb_from_linear));
+    let (end_hue, end_saturation, end_lightness) = hsl_from_srgb(end.map(srgb_from_linear));
+    let start_hue = start_hue.or(end_hue).unwrap_or(0.0);
+    let mut end_hue = end_hue.unwrap_or(start_hue);
+    if end_hue - start_hue > 0.5 {
+        end_hue -= 1.0;
+    } else if end_hue - start_hue < -0.5 {
+        end_hue += 1.0;
+    }
+    (
+        [start_hue, start_saturation, start_lightness],
+        [end_hue, end_saturation, end_lightness],
+    )
+}
+
+fn srgb_from_linear(linear: f32) -> f32 {
+    let linear = linear.clamp(0.0, 1.0);
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Matches srgb_to_linear() in visualizer.wgsl.
+fn linear_from_srgb(srgb: f32) -> f32 {
+    if srgb <= 0.040_45 {
+        srgb / 12.92
+    } else {
+        ((srgb + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Hue in turns (None for grays, where it has no meaning), saturation and
+/// lightness of an sRGB color.
+fn hsl_from_srgb([r, g, b]: [f32; 3]) -> (Option<f32>, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) * 0.5;
+    let chroma = max - min;
+    if chroma < 1e-5 {
+        return (None, 0.0, lightness);
+    }
+    let saturation = (chroma / (1.0 - (2.0 * lightness - 1.0).abs())).min(1.0);
+    let sector = if max == r {
+        (g - b) / chroma
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    (Some((sector / 6.0).rem_euclid(1.0)), saturation, lightness)
+}
+
+/// Matches hsl_to_linear() in visualizer.wgsl.
+fn linear_from_hsl([hue, saturation, lightness]: [f32; 3]) -> [f32; 3] {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    [0.0, 2.0 / 3.0, 1.0 / 3.0].map(|offset: f32| {
+        let pure = (((hue + offset).rem_euclid(1.0) * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
+        linear_from_srgb(lightness + chroma * (pure - 0.5))
+    })
+}
+
+/// The shader's palette_color(): blend within the segment containing t, and
+/// hold the first and last colors beyond the outermost stops.
+fn palette_color(segments: &[[f32; 4]; 2 * PALETTE_SEGMENTS], blend: PaletteBlend, t: f32) -> [f32; 3] {
+    let mut color = [segments[0][0], segments[0][1], segments[0][2]];
+    for pair in segments.chunks_exact(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if t >= start[3] {
+            let span = end[3] - start[3];
+            let amount = if span > 0.0 {
+                ((t - start[3]) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            color = std::array::from_fn(|i| start[i] + (end[i] - start[i]) * amount);
         }
     }
-    color
+    match blend {
+        PaletteBlend::Rgb => color,
+        PaletteBlend::Hsl => linear_from_hsl(color),
+    }
 }
 
 /// A strip showing the palette across the frequency axis, with a tick under
@@ -359,11 +467,11 @@ fn palette_preview(ui: &mut egui::Ui, settings: &VisualizerSettings) {
     const STRIP_HEIGHT: f32 = 10.0;
     let width = ui.available_width().min(240.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, STRIP_HEIGHT + 5.0), egui::Sense::hover());
-    let stops = shader_palette(settings);
+    let segments = shader_palette(settings);
     let painter = ui.painter_at(rect);
     for slice in 0..SLICES {
         let t = (slice as f32 + 0.5) / SLICES as f32;
-        let [r, g, b] = palette_color(&stops, t);
+        let [r, g, b] = palette_color(&segments, settings.palette_blend, t);
         let left = rect.left() + rect.width() * slice as f32 / SLICES as f32;
         let right = rect.left() + rect.width() * (slice + 1) as f32 / SLICES as f32;
         painter.rect_filled(
@@ -374,8 +482,8 @@ fn palette_preview(ui: &mut egui::Ui, settings: &VisualizerSettings) {
     }
     if settings.spectrum_palette == SpectrumPalette::Custom {
         let tick = ui.visuals().strong_text_color();
-        for stop in stops {
-            let x = rect.left() + rect.width() * stop[3];
+        for stop in settings.custom_palette {
+            let x = rect.left() + rect.width() * (stop.position_percent / 100.0).clamp(0.0, 1.0);
             painter.line_segment(
                 [egui::pos2(x, rect.top() + STRIP_HEIGHT), egui::pos2(x, rect.bottom())],
                 egui::Stroke::new(1.5, tick),
@@ -694,6 +802,7 @@ impl Default for VisualizerSettings {
             frequency_focus_origin_percent: 50.0,
             transparent_background: false,
             spectrum_palette: SpectrumPalette::Default,
+            palette_blend: PaletteBlend::Rgb,
             custom_palette: SpectrumPalette::Default
                 .preset_stops()
                 .unwrap()
@@ -2049,6 +2158,19 @@ fn draw_settings_panel(
                             );
                         }
                     });
+                egui::ComboBox::from_label("Blend")
+                    .selected_text(settings.palette_blend.label())
+                    .show_ui(ui, |ui| {
+                        for blend in [PaletteBlend::Rgb, PaletteBlend::Hsl] {
+                            ui.selectable_value(&mut settings.palette_blend, blend, blend.label());
+                        }
+                    });
+                if settings.palette_blend == PaletteBlend::Hsl {
+                    ui.small(
+                        "Hue takes the shorter way around the color wheel; toward white, gray, \
+                         or black only saturation and lightness change.",
+                    );
+                }
                 if settings.spectrum_palette == SpectrumPalette::Custom {
                     egui::Grid::new("custom palette stops")
                         .num_columns(2)
@@ -3866,7 +3988,7 @@ impl GpuState {
                         .settings
                         .surface_peak_depth_brightness_percent,
                     volume_stage_count: self.settings.surface_volume_stage_count as f32,
-                    _padding_0: 0.0,
+                    palette_blend: self.settings.palette_blend.shader_value(),
                     _padding_1: 0.0,
                     _padding_2: 0.0,
                     palette: shader_palette(&self.settings),
@@ -4970,7 +5092,7 @@ fn create_analyzer_channel(
             bar_depth_pixels: 0.0,
             peak_depth_brightness_percent: 0.0,
             volume_stage_count: 3.0,
-            _padding_0: 0.0,
+            palette_blend: settings.palette_blend.shader_value(),
             _padding_1: 0.0,
             _padding_2: 0.0,
             palette: shader_palette(settings),
@@ -5622,7 +5744,7 @@ mod tests {
         for step in 0..=200 {
             let t = step as f32 / 200.0;
             let original = mix(mix(low, middle, (t * 2.0).min(1.0)), high, (t * 2.0 - 1.0).max(0.0));
-            assert_color_near(palette_color(&stops, t), original, 1e-6, t);
+            assert_color_near(palette_color(&stops, PaletteBlend::Rgb, t), original, 1e-6, t);
         }
         // Custom starts from the same stops, within 8-bit sRGB rounding.
         let custom = VisualizerSettings {
@@ -5685,7 +5807,10 @@ mod tests {
             ..Default::default()
         };
         let stops = shader_palette(&settings);
-        assert_eq!(stops.map(|stop| stop[3]), [0.0, 0.0, 0.5, 0.5, 1.0]);
+        assert_eq!(
+            stops.map(|point| point[3]),
+            [0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0]
+        );
         for (t, expected) in [
             (0.0, [0.0, 0.0, 1.0]),
             (0.25, [0.0, 0.5, 0.5]),
@@ -5694,7 +5819,7 @@ mod tests {
             (0.75, [1.0, 0.5, 0.5]),
             (1.0, [1.0, 0.0, 0.0]),
         ] {
-            assert_color_near(palette_color(&stops, t), expected, 1e-4, t);
+            assert_color_near(palette_color(&stops, PaletteBlend::Rgb, t), expected, 1e-4, t);
         }
         // Colors hold beyond the outermost stops.
         let inset = VisualizerSettings {
@@ -5708,9 +5833,218 @@ mod tests {
             ..settings
         };
         let stops = shader_palette(&inset);
-        assert_color_near(palette_color(&stops, 0.1), [0.0, 0.0, 1.0], 0.0, 0.1);
-        assert_color_near(palette_color(&stops, 0.35), [0.0, 0.5, 0.5], 1e-6, 0.35);
-        assert_color_near(palette_color(&stops, 0.9), [1.0, 0.0, 0.0], 0.0, 0.9);
+        assert_color_near(palette_color(&stops, PaletteBlend::Rgb, 0.1), [0.0, 0.0, 1.0], 0.0, 0.1);
+        assert_color_near(palette_color(&stops, PaletteBlend::Rgb, 0.35), [0.0, 0.5, 0.5], 1e-6, 0.35);
+        assert_color_near(palette_color(&stops, PaletteBlend::Rgb, 0.9), [1.0, 0.0, 0.0], 0.0, 0.9);
+    }
+
+    #[test]
+    fn hsl_blend_follows_the_color_wheel() {
+        let stop = |srgb, position_percent| ColorStop {
+            srgb,
+            position_percent,
+        };
+        let custom = |stops| VisualizerSettings {
+            spectrum_palette: SpectrumPalette::Custom,
+            palette_blend: PaletteBlend::Hsl,
+            custom_palette: stops,
+            ..Default::default()
+        };
+        let color_at = |settings: &VisualizerSettings, t: f32| {
+            palette_color(&shader_palette(settings), settings.palette_blend, t)
+        };
+        let (red, blue, white) = ([255, 0, 0], [0, 0, 255], [255; 3]);
+        // Red to blue passes through full magenta, not dark purple.
+        let red_blue = custom([
+            stop(red, 0.0),
+            stop(red, 0.0),
+            stop(red, 0.0),
+            stop(blue, 100.0),
+            stop(blue, 100.0),
+        ]);
+        assert_color_near(color_at(&red_blue, 0.0), [1.0, 0.0, 0.0], 1e-6, 0.0);
+        assert_color_near(color_at(&red_blue, 0.5), [1.0, 0.0, 1.0], 1e-6, 0.5);
+        assert_color_near(color_at(&red_blue, 1.0), [0.0, 0.0, 1.0], 1e-6, 1.0);
+        let rgb = VisualizerSettings {
+            palette_blend: PaletteBlend::Rgb,
+            ..red_blue.clone()
+        };
+        assert_color_near(color_at(&rgb, 0.5), [0.5, 0.0, 0.5], 1e-6, 0.5);
+        // Magenta-pink (330 degrees) to orange (30 degrees) wraps through red,
+        // not through green and blue.
+        let wrap = custom([
+            stop([255, 0, 128], 0.0),
+            stop([255, 0, 128], 0.0),
+            stop([255, 0, 128], 0.0),
+            stop([255, 128, 0], 100.0),
+            stop([255, 128, 0], 100.0),
+        ]);
+        assert_color_near(color_at(&wrap, 0.5), [1.0, 0.0, 0.0], 1e-6, 0.5);
+        // Toward white the hue stays red: a light red midway.
+        let red_white = custom([
+            stop(red, 0.0),
+            stop(red, 0.0),
+            stop(red, 0.0),
+            stop(white, 100.0),
+            stop(white, 100.0),
+        ]);
+        let [r, g, b] = color_at(&red_white, 0.5);
+        let expected = [0.875, 0.625, 0.625].map(linear_from_srgb);
+        assert_color_near([r, g, b], expected, 1e-6, 0.5);
+        // HSL round-trips every preset stop, so stops keep their colors.
+        for palette in SpectrumPalette::ALL {
+            let Some(stops) = palette.preset_stops() else { continue };
+            for (color, _) in stops {
+                let (hue, saturation, lightness) = hsl_from_srgb(color.map(srgb_from_linear));
+                let back = linear_from_hsl([hue.unwrap_or(0.0), saturation, lightness]);
+                assert_color_near(back, color, 2e-5, 0.0);
+            }
+        }
+        let json = serde_json::to_value(&red_white).unwrap();
+        assert_eq!(json["palette_blend"], "Hsl");
+        let old: VisualizerSettings = serde_json::from_str(r#"{"gain":2.0}"#).unwrap();
+        assert_eq!(old.palette_blend, PaletteBlend::Rgb);
+    }
+
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn gpu_palette_matches_the_preview() {
+        const SAMPLES: usize = 257;
+        let source = format!(
+            "{}\n{}",
+            include_str!("visualizer.wgsl"),
+            r#"
+@group(0) @binding(20) var<storage, read_write> probe: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn probe_palette(@builtin(global_invocation_id) id: vec3<u32>) {
+    let count = arrayLength(&probe);
+    if (id.x >= count) {
+        return;
+    }
+    probe[id.x] = vec4(palette_color(f32(id.x) / f32(count - 1u)), 1.0);
+}
+"#
+        );
+        let stop = |srgb, position_percent| ColorStop {
+            srgb,
+            position_percent,
+        };
+        let custom = VisualizerSettings {
+            spectrum_palette: SpectrumPalette::Custom,
+            // Out of order, with a gray stop, a hard edge at 60 % and a hue
+            // wrap through red.
+            custom_palette: [
+                stop([255, 0, 128], 100.0),
+                stop([20, 40, 230], 10.0),
+                stop([128, 128, 128], 35.0),
+                stop([255, 200, 0], 60.0),
+                stop([0, 220, 90], 60.0),
+            ],
+            ..Default::default()
+        };
+        let mut cases = Vec::new();
+        for blend in [PaletteBlend::Rgb, PaletteBlend::Hsl] {
+            for palette in SpectrumPalette::ALL {
+                cases.push(VisualizerSettings {
+                    spectrum_palette: palette,
+                    palette_blend: blend,
+                    ..custom.clone()
+                });
+            }
+        }
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL,
+                ..Default::default()
+            });
+            let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("palette probe"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("palette probe"),
+                layout: None,
+                module: &module,
+                entry_point: Some("probe_palette"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            let size = (SAMPLES * std::mem::size_of::<[f32; 4]>()) as u64;
+            let mut largest_error = 0.0_f32;
+            for settings in &cases {
+                let channel = RenderChannelParams {
+                    palette_blend: settings.palette_blend.shader_value(),
+                    palette: shader_palette(settings),
+                    ..bytemuck::Zeroable::zeroed()
+                };
+                let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: std::mem::size_of::<RenderChannelParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&channel));
+                let output = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 20,
+                            resource: output.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &bindings, &[]);
+                    pass.dispatch_workgroups((SAMPLES as u32).div_ceil(64), 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, size);
+                queue.submit([encoder.finish()]);
+                let (tx, rx) = std::sync::mpsc::channel();
+                readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                rx.recv().unwrap().unwrap();
+                let mapped = readback.slice(..).get_mapped_range();
+                let gpu: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
+                let segments = shader_palette(settings);
+                for (index, [r, g, b, _]) in gpu.iter().copied().enumerate() {
+                    let t = index as f32 / (SAMPLES - 1) as f32;
+                    let cpu = palette_color(&segments, settings.palette_blend, t);
+                    for (gpu, cpu) in [r, g, b].into_iter().zip(cpu) {
+                        largest_error = largest_error.max((gpu - cpu).abs());
+                    }
+                    assert_color_near([r, g, b], cpu, 1e-4, t);
+                }
+            }
+            eprintln!(
+                "Palette: {} cases x {SAMPLES} samples; largest GPU-CPU difference {largest_error:.2e}.",
+                cases.len()
+            );
+        });
     }
 
     #[test]

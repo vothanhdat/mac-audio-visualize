@@ -26,12 +26,15 @@ struct RenderChannelParams {
     bar_depth_pixels: f32,
     peak_depth_brightness_percent: f32,
     volume_stage_count: f32,
-    _padding_0: f32,
+    // 0 blends linear RGB, 1 blends hue, saturation and lightness.
+    palette_blend: f32,
     _padding_1: f32,
     _padding_2: f32,
-    // Color stops in position order: linear color in rgb and position across
-    // the frequency axis (0 to 1) in w.
-    palette: array<vec4<f32>, 5>,
+    // The four segments between neighboring color stops, each a start and an
+    // end in position order. xyz is linear RGB, or for HSL blending the hue
+    // in turns, saturation and lightness; w is the position across the
+    // frequency axis (0 to 1).
+    palette: array<vec4<f32>, 8>,
 }
 
 @group(0) @binding(7) var<storage, read> spectrum: array<vec4<f32>>;
@@ -506,18 +509,33 @@ struct FlatBarOut {
     @location(2) reflection_alpha: f32,
 }
 
-// The selected palette across the frequency axis: blend between neighboring
-// stops, and hold the first and last colors beyond them. Segments below bin_t
-// mix fully to their stop, segments above it not at all. Stops at the same
-// position make a hard edge.
+fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
+    return select(pow((srgb + 0.055) / 1.055, vec3(2.4)), srgb / 12.92, srgb <= vec3(0.04045));
+}
+
+fn hsl_to_linear(hsl: vec3<f32>) -> vec3<f32> {
+    let chroma = (1.0 - abs(2.0 * hsl.z - 1.0)) * hsl.y;
+    let hue = fract(hsl.x + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0));
+    let pure = clamp(abs(hue * 6.0 - 3.0) - 1.0, vec3(0.0), vec3(1.0));
+    return srgb_to_linear(hsl.z + chroma * (pure - 0.5));
+}
+
+// The selected palette across the frequency axis. The last segment starting
+// at or before bin_t holds it; stops at the same position make a hard edge,
+// and the first and last colors hold beyond the outermost stops.
 fn palette_color(bin_t: f32) -> vec3<f32> {
-    var color = render_channel.palette[0].rgb;
-    for (var i = 1u; i < 5u; i = i + 1u) {
-        let previous = render_channel.palette[i - 1u].w;
-        let next = render_channel.palette[i];
-        let span = next.w - previous;
-        let ramp = clamp((bin_t - previous) / max(span, 1e-6), 0.0, 1.0);
-        color = mix(color, next.rgb, select(step(next.w, bin_t), ramp, span > 0.0));
+    var color = render_channel.palette[0].xyz;
+    for (var i = 0u; i < 8u; i = i + 2u) {
+        let start = render_channel.palette[i];
+        let end = render_channel.palette[i + 1u];
+        if (bin_t >= start.w) {
+            let span = end.w - start.w;
+            let ramp = clamp((bin_t - start.w) / max(span, 1e-6), 0.0, 1.0);
+            color = mix(start.xyz, end.xyz, select(1.0, ramp, span > 0.0));
+        }
+    }
+    if (render_channel.palette_blend >= 0.5) {
+        return hsl_to_linear(color);
     }
     return color;
 }

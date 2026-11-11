@@ -160,8 +160,14 @@ pink), **Fire**, **Ocean**, **Sunset**, **Forest**, **Monochrome**, or **Custom*
 Custom has five color stops, each with a color picker and a position from 0%
 (the lowest frequency shown) to 100% (the highest). Colors blend between
 neighboring stops in position order, hold their color beyond the first and last
-stops, and change abruptly where two stops share a position. A strip beneath
-the menu previews the gradient, with a tick at each custom stop. **Copy to
+stops, and change abruptly where two stops share a position. **Blend** chooses
+how: **RGB** (the default) mixes red, green, and blue light, while **Hue,
+saturation, lightness** mixes those three values instead, so red → blue passes
+through bright magenta rather than a dark purple. Hue takes the shorter way
+around the color wheel, and toward white, gray, or black only saturation and
+lightness change, so red → white passes through pinks. Blend applies to presets
+too. A strip beneath the menu previews the gradient, with a tick at each custom
+stop. **Copy to
 Custom** loads a preset's stops for editing, replacing the current custom stops.
 Loud bars still blend toward white. Custom stops are kept when you switch to a
 preset and back, and the choice is saved; **Reset defaults** restores the

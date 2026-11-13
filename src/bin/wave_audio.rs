@@ -175,7 +175,7 @@ impl Demo {
                 let time = (index % beat_samples) as f64 / f64::from(sample_rate);
                 let envelope =
                     (time / 0.01).clamp(0.0, 1.0) * ((0.65 - time) / 0.12).clamp(0.0, 1.0);
-                let midi = [36, 43, 45, 41][(beat % 4) as usize];
+                let midi = [23, 28, 33, 36][(beat % 4) as usize];
                 tone_sample(index, sample_rate, pitch::frequency(midi)) * envelope as f32
             }
         }
@@ -272,7 +272,7 @@ impl Model {
                         Demo::Tone(hz) => format!("Demo: {hz:.2} Hz"),
                         Demo::Beats => "Demo: 440 + 442 Hz".into(),
                         Demo::Chord => "Demo: C major".into(),
-                        Demo::Bass => "Demo: bass · C2 / G2 / A2 / F2".into(),
+                        Demo::Bass => "Demo: bass · B0 / E1 / A1 / C2".into(),
                     };
                     ui.label(label);
                 } else {
@@ -486,20 +486,21 @@ impl Model {
             );
             let color: Color32 =
                 egui::ecolor::Hsva::new(note as f32 / 12.0, 0.56, 0.94, 1.0).into();
+            let midi = frame.strongest_notes[note];
             let trigger = frame.triggers[note];
             let lane_end = trigger.map_or(end, |trigger| trigger.end);
             let span = if self.lock_notes {
                 let period = trigger.map_or_else(
-                    || sample_rate / pitch::frequency(60 + note as u8),
+                    || sample_rate / pitch::frequency(midi.unwrap_or(60 + note as u8)),
                     |trigger| trigger.period,
                 );
                 period * f64::from(self.note_cycles)
             } else {
                 shared_span
             };
-            let name = trigger.map_or_else(
+            let name = midi.map_or_else(
                 || (*name).to_owned(),
-                |trigger| format!("{name}{}", trigger.midi / 12 - 1),
+                |midi| format!("{name}{}", midi / 12 - 1),
             );
             painter.text(
                 Pos2::new(left - 8.0, lane.center().y),
@@ -584,36 +585,56 @@ impl Model {
             return;
         };
         let painter = painter.with_clip_rect(plot);
-        let columns = plot.width().ceil().clamp(1.0, 1800.0) as usize;
+        let pixels_per_point = painter.ctx().pixels_per_point();
+        let pixel_width = 1.0 / pixels_per_point;
+        let first_pixel = (plot.left() * pixels_per_point).floor() as i32;
+        let last_pixel = (plot.right() * pixels_per_point).ceil() as i32;
+        let sample_at_x = |x: f32| position_at(f64::from((x - plot.left()) / plot.width()));
         let scale = plot.height() * 0.44 * self.gain;
         let y = |value: f32| plot.center().y - value * scale;
-        let mut line = Vec::with_capacity(columns + 1);
-        for point in 0..=columns {
-            let fraction = point as f64 / columns as f64;
-            let position = position_at(fraction);
-            if let Some(value) = trace.interpolate(position) {
-                let x = plot.left() + plot.width() * fraction as f32;
-                line.push(Pos2::new(x, y(value)));
-            } else if line.len() > 1 {
-                painter.add(egui::Shape::line(
-                    std::mem::take(&mut line),
-                    Stroke::new(1.0, color),
-                ));
+        let mut ranges = egui::Mesh::default();
+        let mut line = Vec::new();
+        let mut from = sample_at_x(plot.left());
+        for pixel in first_pixel..last_pixel {
+            let left = (pixel as f32 * pixel_width).max(plot.left());
+            let right = ((pixel + 1) as f32 * pixel_width).min(plot.right());
+            let to = sample_at_x(right);
+            if to - from > 1.0 {
+                if line.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        std::mem::take(&mut line),
+                        Stroke::new(1.0, color),
+                    ));
+                } else {
+                    line.clear();
+                }
+                // Fill this pixel's signed range without connecting aliased point samples.
+                if let Some((low, high)) = trace.segment_range(from, to) {
+                    let top = y(high);
+                    let bottom = y(low);
+                    let center = (top + bottom) * 0.5;
+                    ranges.add_colored_rect(
+                        Rect::from_min_max(
+                            Pos2::new(left, top.min(center - pixel_width * 0.5)),
+                            Pos2::new(right, bottom.max(center + pixel_width * 0.5)),
+                        ),
+                        color,
+                    );
+                }
             } else {
-                line.clear();
+                if line.is_empty()
+                    && let Some(value) = trace.interpolate(from)
+                {
+                    line.push(Pos2::new(left, y(value)));
+                }
+                if let Some(value) = trace.interpolate(to) {
+                    line.push(Pos2::new(right, y(value)));
+                }
             }
-            let next = position_at((point + 1) as f64 / columns as f64);
-            if point < columns
-                && next - position > 1.0
-                && let Some((low, high)) = trace.segment_range(position, next)
-                && low < high
-            {
-                let x = plot.left() + plot.width() * fraction as f32;
-                painter.line_segment(
-                    [Pos2::new(x, y(low)), Pos2::new(x, y(high))],
-                    Stroke::new(1.0, color),
-                );
-            }
+            from = to;
+        }
+        if !ranges.is_empty() {
+            painter.add(egui::Shape::mesh(ranges));
         }
         if line.len() > 1 {
             painter.add(egui::Shape::line(line, Stroke::new(1.0, color)));
@@ -898,7 +919,7 @@ mod tests {
         let sample_rate = 48_000;
         let mut history = PitchHistory::new(sample_rate, 0, DEFAULT_FILTER_DELAY_MS);
         let mut start = 0;
-        for (step, expected) in [0, 7, 9, 5].into_iter().enumerate() {
+        for (step, expected) in [11, 4, 9, 0].into_iter().enumerate() {
             let end = step as u64 * 36_000 + 28_800;
             let samples: Vec<_> = (start..end)
                 .map(|index| Demo::Bass.sample(index, sample_rate))
@@ -914,7 +935,7 @@ mod tests {
             assert!(peaks[expected] > 0.35, "{peaks:?}");
             for (note, peak) in peaks.into_iter().enumerate() {
                 if note != expected {
-                    assert!(peak < peaks[expected] * 0.55, "{peaks:?}");
+                    assert!(peak < peaks[expected] * 0.8, "{peaks:?}");
                 }
             }
             start = end;

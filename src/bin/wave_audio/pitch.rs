@@ -95,7 +95,6 @@ impl NoteBand {
 
 #[derive(Clone, Copy)]
 pub struct Trigger {
-    pub midi: u8,
     pub end: f64,
     pub period: f64,
 }
@@ -103,6 +102,7 @@ pub struct Trigger {
 #[derive(Clone, Copy, Default)]
 pub struct PitchFrame {
     pub triggers: [Option<Trigger>; NOTES.len()],
+    pub strongest_notes: [Option<u8>; NOTES.len()],
     pub silent: bool,
 }
 
@@ -124,7 +124,7 @@ impl PitchHistory {
         let history_size = 4 * sample_rate as usize;
         let block_seconds = block_size as f64 / f64::from(sample_rate);
         Self {
-            bands: (36..=95) // C2 through B6
+            bands: (21..=95) // A0 through B6
                 .take_while(|&midi| frequency(midi) < 0.45 * f64::from(sample_rate))
                 .map(|midi| NoteBand::new(midi, sample_rate, max_delay_ms))
                 .collect(),
@@ -183,32 +183,33 @@ impl PitchHistory {
     }
 
     fn save_frame(&mut self, block: u64) {
-        let mut strongest = [0.0; NOTES.len()];
-        let mut triggers = [None; NOTES.len()];
+        let mut frame = PitchFrame {
+            silent: self.quiet_samples >= self.silence_samples,
+            ..Default::default()
+        };
+        let mut strongest = [1e-10; NOTES.len()];
         let end = (self.next_sample - 1) as f64;
         for band in &mut self.bands {
             let mean = band.block_power / self.block_size as f64;
             band.block_power = 0.0;
             band.power += (mean - band.power) * self.power_smoothing;
-            if band.power > 1e-10
-                && band.power > strongest[band.pitch_class]
-                && let Some(crossing) = band.crossing
-                && let Some(period) = band.period
-                && end - crossing <= 2.0 * period
-            {
-                strongest[band.pitch_class] = band.power;
-                triggers[band.pitch_class] = Some(Trigger {
-                    midi: band.midi,
-                    end: crossing,
-                    period,
-                });
+            let lane = band.pitch_class;
+            if band.power > strongest[lane] {
+                strongest[lane] = band.power;
+                frame.strongest_notes[lane] = Some(band.midi);
+                frame.triggers[lane] = match (band.crossing, band.period) {
+                    (Some(crossing), Some(period)) if end - crossing <= 2.0 * period => {
+                        Some(Trigger {
+                            end: crossing,
+                            period,
+                        })
+                    }
+                    _ => None,
+                };
             }
         }
         let slot = block as usize % self.frames.len();
-        self.frames[slot] = PitchFrame {
-            triggers,
-            silent: self.quiet_samples >= self.silence_samples,
-        };
+        self.frames[slot] = frame;
     }
 
     pub fn frame_at(&self, end: f64) -> PitchFrame {
@@ -294,6 +295,30 @@ mod tests {
     }
 
     #[test]
+    fn sub_bass_is_visible_before_phase_lock_and_locks_when_sustained() {
+        let sample_rate = 48_000;
+        for midi in [21, 23, 28] {
+            let tone = input(&[midi], sample_rate);
+            let mut history = PitchHistory::new(sample_rate, 0, DEFAULT_FILTER_DELAY_MS);
+            let lane = usize::from(midi % 12);
+            history.ingest(&tone[..960]);
+            let onset = history.frame_at(959.0);
+            assert!(onset.triggers[lane].is_none());
+            assert_eq!(onset.strongest_notes[lane], Some(midi));
+            history.ingest(&tone[960..]);
+            let end = f64::from(sample_rate - 1);
+            let frame = history.frame_at(end);
+            assert_eq!(frame.strongest_notes[lane], Some(midi));
+            assert!(frame.triggers[lane].is_some());
+            let (low, high) = history
+                .trace(lane)
+                .segment_range(end - 2400.0, end)
+                .unwrap();
+            assert!(low < -0.23 && high > 0.23, "{midi}: {low}, {high}");
+        }
+    }
+
+    #[test]
     fn locks_lanes_to_independent_periods_at_the_requested_time() {
         let sample_rate = 48_000;
         let start = 1000;
@@ -312,10 +337,10 @@ mod tests {
             history.ingest(chunk);
         }
         for end in [47_053.25, 48_901.75] {
-            let triggers = history.frame_at(end).triggers;
+            let frame = history.frame_at(end);
             for (note, midi, hz) in [(9, 57, a_hz), (0, 60, c_hz)] {
-                let trigger = triggers[note].unwrap();
-                assert_eq!(trigger.midi, midi);
+                let trigger = frame.triggers[note].unwrap();
+                assert_eq!(frame.strongest_notes[note], Some(midi));
                 let period = f64::from(sample_rate) / hz;
                 assert!((trigger.period - period).abs() < 0.5);
                 assert!(trigger.end <= end && end - trigger.end < period + 240.0);

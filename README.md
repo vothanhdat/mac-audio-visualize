@@ -410,13 +410,14 @@ cargo run --release --bin wave-audio -- --device NAME
 ### 12 notes (default)
 
 Each lane sums the signed output of the bandpass filters for its pitch class
-across C2 to B6. The A lane combines
-A2, A3, A4, A5, and A6 sample by sample. The traces swing above and below
-zero on a linear amplitude scale.
+from A0 (27.5 Hz) through B6. The traces swing above and below zero on a
+linear amplitude scale.
 
 **Phase lock** is on by default. Each lane uses a rising zero crossing in its
-strongest octave to hold a steady tone in place. The label shows the trigger
-octave, and **Cycles** sets the visible span (1–12, default 3). Lanes with
+strongest octave to hold a steady tone in place. Before a crossing is
+available, the lane scrolls using the strongest note's nominal period.
+The label shows the selected octave, and **Cycles** sets the visible span
+(1–12, default 3). Lanes with
 several notes in different octaves can still move as those notes overlap.
 Turn off **Phase lock** to use the shared **Time window** of 20 to 500 ms
 with the newest audio on the right.
@@ -467,9 +468,9 @@ labels beneath the curve show F(u).
 - **Target FPS:** defaults to 120, independently of F(u). Actual presentation is
   limited by the display/VSync and rendering work. All sampling positions come
   from audio timestamps, not a per-frame scroll increment.
-- **Dense portions:** each pixel uses extrema of its actual raw-sample interval
-  when that interval spans more than one sample. The continuous signed curve is
-  also drawn; there are no additional frequency traces. Missing history stays
+- **Dense portions:** in both views, a physical pixel that spans more than one
+  sample interval shows the minimum and maximum of the signed waveform in that
+  column. Zoomed-in portions show the interpolated curve. Missing history stays
   blank. At high reference frequencies only a few captured samples represent a
   period, so interpolated shapes are limited by the sample rate.
 - **Output timing:** native capture follows reported device delay, with a signed

@@ -65,7 +65,11 @@ fn pitch_class_power(
         return result;
     }
     let bin_hz = sample_rate / size as f32;
-    for bin in 1..magnitudes.len() - 1 {
+    // Interpolation moves a peak by at most half a bin, so bins further than
+    // one from the range cannot contribute.
+    let first = ((lower / bin_hz) as usize).saturating_sub(1).max(1);
+    let end = ((upper / bin_hz) as usize + 3).min(magnitudes.len() - 1);
+    for bin in first..end {
         let magnitude = magnitudes[bin];
         if magnitude < 1e-7 || magnitude <= magnitudes[bin - 1] || magnitude < magnitudes[bin + 1] {
             continue;

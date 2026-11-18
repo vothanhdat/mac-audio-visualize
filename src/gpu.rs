@@ -3524,13 +3524,13 @@ impl GpuState {
         self.observe_audio(drained);
     }
 
-    /// True once the newest audio has been silent long enough for every bar,
-    /// peak, glow and trail to settle, so the frame on screen stays correct.
     /// The chosen frame rate, or `None` to follow the display refresh.
     pub fn frame_rate_limit(&self) -> Option<u32> {
         self.settings.frame_rate_limit.frames_per_second()
     }
 
+    /// True once the newest audio has been silent long enough for every bar,
+    /// peak, glow and trail to settle, so the frame on screen stays correct.
     pub fn idle_ready(&self) -> bool {
         self.silence.settled(
             idle_settle_frames(&self.settings),
@@ -3661,26 +3661,15 @@ impl GpuState {
         self.observe_audio(drained_sample_count);
         self.silence.count_frame();
         let active_channel_count = self.settings.channel_mode.channel_count();
-        for channel_index in 0..active_channel_count {
-            let analyzer = &mut self.analyzers[channel_index];
-            match self.settings.channel_mode {
-                ChannelMode::Mono => {
-                    for ((output, left), right) in analyzer
-                        .audio_history
-                        .iter_mut()
-                        .zip(&self.left_history)
-                        .zip(&self.right_history)
-                    {
-                        *output = (*left + *right) * 0.5;
-                    }
-                }
-                ChannelMode::Left | ChannelMode::StereoMirror if channel_index == 0 => {
-                    analyzer.audio_history.copy_from_slice(&self.left_history);
-                }
-                ChannelMode::Right | ChannelMode::StereoMirror => {
-                    analyzer.audio_history.copy_from_slice(&self.right_history);
-                }
-                ChannelMode::Left => unreachable!(),
+        let channel_mode = self.settings.channel_mode;
+        if channel_mode == ChannelMode::Mono {
+            for ((output, left), right) in self.analyzers[0]
+                .audio_history
+                .iter_mut()
+                .zip(&self.left_history)
+                .zip(&self.right_history)
+            {
+                *output = (*left + *right) * 0.5;
             }
         }
         let requested_delay =
@@ -3705,10 +3694,20 @@ impl GpuState {
             history_sample_count.saturating_sub(SAMPLE_COUNT + resonator_alignment_delay);
         let delay_samples = requested_delay.min(maximum_delay);
         let end = history_sample_count - delay_samples;
-        for analyzer in &mut self.analyzers[..active_channel_count] {
+        for (channel_index, analyzer) in self.analyzers[..active_channel_count]
+            .iter_mut()
+            .enumerate()
+        {
+            let history = channel_history(
+                channel_mode,
+                channel_index,
+                &analyzer.audio_history,
+                &self.left_history,
+                &self.right_history,
+            );
             analyzer
                 .samples
-                .copy_from_slice(&analyzer.audio_history[end - SAMPLE_COUNT..end]);
+                .copy_from_slice(&history[end - SAMPLE_COUNT..end]);
         }
         let bin_count = display_bin_count(&self.settings, self.size, self.sample_rate);
         let db_floors = [self.settings.low_db_floor, self.settings.high_db_floor];
@@ -3851,7 +3850,14 @@ impl GpuState {
             .iter_mut()
             .enumerate()
         {
-            let uploaded_samples = &analyzer.audio_history[aligned_end - SAMPLE_COUNT..aligned_end];
+            let history = channel_history(
+                channel_mode,
+                channel_index,
+                &analyzer.audio_history,
+                &self.left_history,
+                &self.right_history,
+            );
+            let uploaded_samples = &history[aligned_end - SAMPLE_COUNT..aligned_end];
             if self.settings.analysis_method == AnalysisMethod::HybridResonatorFft
                 && self.settings.hybrid_adaptive_matching
             {
@@ -3888,12 +3894,12 @@ impl GpuState {
                 if multirate_fft_needs_reset {
                     analyzer
                         .multirate_fft
-                        .reset(fft_config, &analyzer.audio_history[..fft_end]);
+                        .reset(fft_config, &history[..fft_end]);
                 } else {
                     let new_count = drained_sample_count.min(fft_end);
                     analyzer
                         .multirate_fft
-                        .ingest(&analyzer.audio_history[fft_end - new_count..fft_end]);
+                        .ingest(&history[fft_end - new_count..fft_end]);
                 }
                 if let Some(magnitudes) = analyzer
                     .multirate_fft
@@ -4966,6 +4972,23 @@ fn resource_mode(settings: &VisualizerSettings, sample_rate: f32) -> ResourceMod
 
 /// Shared capture history: at least one second beyond the analyzer block, so
 /// the output delay (up to one second) always has samples behind it.
+/// The audio one output channel analyzes. Only a mono mix needs its own buffer.
+fn channel_history<'a>(
+    mode: ChannelMode,
+    channel_index: usize,
+    mono_mix: &'a [f32],
+    left: &'a [f32],
+    right: &'a [f32],
+) -> &'a [f32] {
+    match mode {
+        ChannelMode::Mono => mono_mix,
+        ChannelMode::Left => left,
+        ChannelMode::Right => right,
+        ChannelMode::StereoMirror if channel_index == 0 => left,
+        ChannelMode::StereoMirror => right,
+    }
+}
+
 fn history_sample_count(sample_rate: u32) -> usize {
     HISTORY_SAMPLE_COUNT.max(SAMPLE_COUNT + sample_rate as usize)
 }
@@ -6189,6 +6212,17 @@ fn probe_palette(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(silence.since.is_none(), "restart must not start silence");
         silence.count_frame();
         assert_eq!(silence.frames, 0);
+    }
+
+    #[test]
+    fn each_channel_mode_analyzes_its_own_audio() {
+        let (mono, left, right) = ([0.5], [1.0], [2.0]);
+        let level = |mode, channel| channel_history(mode, channel, &mono, &left, &right)[0];
+        assert_eq!(level(ChannelMode::Mono, 0), 0.5);
+        assert_eq!(level(ChannelMode::Left, 0), 1.0);
+        assert_eq!(level(ChannelMode::Right, 0), 2.0);
+        assert_eq!(level(ChannelMode::StereoMirror, 0), 1.0);
+        assert_eq!(level(ChannelMode::StereoMirror, 1), 2.0);
     }
 
     #[test]

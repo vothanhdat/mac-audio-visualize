@@ -575,6 +575,23 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     return out;
 }
 
+// Opacity falls by 2.5 decades (a factor of 316) across the faded part of a
+// bar, because equal ratios of light look like equal steps of brightness.
+const BAR_TOP_FADE_LOG2_RANGE = 8.304820;
+const BAR_TOP_FADE_FLOOR = 0.00316228;
+
+// Easing the position keeps both ends of the fade free of a visible crease,
+// and subtracting the floor makes the tip reach exactly zero.
+fn bar_top_fade(height: f32) -> f32 {
+    let fade = params.db_scale.w;
+    if (fade <= 0.0001) {
+        return 1.0;
+    }
+    let eased = smoothstep(1.0 - fade, 1.0, height);
+    let light = exp2(-BAR_TOP_FADE_LOG2_RANGE * eased);
+    return (light - BAR_TOP_FADE_FLOOR) / (1.0 - BAR_TOP_FADE_FLOOR);
+}
+
 fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
     let frequency_color = palette_color(in.bin_t);
     let white_hot = smoothstep(0.70, 1.0, in.energy) * 0.88;
@@ -591,8 +608,8 @@ fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
     let energy_glow = mix(params.visual.x, params.visual.y, in.energy * in.energy);
     let transient_glow = 1.0 + onset * 1.35;
     var top_fade = 1.0;
-    if (params.db_scale.w > 0.0001 && abs(face_kind - 1.0) > 0.25) {
-        top_fade = 1.0 - smoothstep(1.0 - params.db_scale.w, 1.0, in.uv.y);
+    if (abs(face_kind - 1.0) > 0.25) {
+        top_fade = bar_top_fade(in.uv.y);
     }
     var face_light = 1.0;
     if (face_kind > 1.5) {
@@ -610,10 +627,7 @@ fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
 @fragment
 fn fs_main(in: FlatBarOut) -> @location(0) vec4<f32> {
     let vertical_glow = 0.58 + 0.42 * in.uv.y;
-    var top_fade = 1.0;
-    if (params.db_scale.w > 0.0001) {
-        top_fade = 1.0 - smoothstep(1.0 - params.db_scale.w, 1.0, in.uv.y);
-    }
+    let top_fade = bar_top_fade(in.uv.y);
     return vec4(in.light * vertical_glow * in.reflection_alpha,
         0.92 * top_fade * in.reflection_alpha);
 }
@@ -683,11 +697,7 @@ fn prism_fs(in: BarOut) -> @location(0) vec4<f32> {
     let vertical_glow = 0.58 + 0.42 * in.uv.y;
     let energy_glow =
         mix(params.visual.x, params.visual.y, in.energy * in.energy);
-    var top_fade = 1.0;
-    if (params.db_scale.w > 0.0001) {
-        top_fade =
-            1.0 - smoothstep(1.0 - params.db_scale.w, 1.0, in.uv.y);
-    }
+    let top_fade = bar_top_fade(in.uv.y);
     let final_layer = in.reflection_alpha >= 0.5;
     let depth_light = mix(0.22, 0.72, pow(in.response, 1.4));
     let layer_light = select(depth_light, 1.0, final_layer);

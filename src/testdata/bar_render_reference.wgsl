@@ -61,7 +61,7 @@ fn glow_fs(in: BarOut) -> @location(0) vec4<f32> {
     let horizontal = pow(max(1.0 - abs(in.uv.x * 2.0 - 1.0), 0.0), 3.0);
     let onset = in.transient * params.frequency_range.w;
     let strength = horizontal * smoothstep(0.45, 1.0, in.energy) *
-        (0.07 + 0.09 * in.uv.y) * (1.0 + onset * 1.8);
+        (0.07 + 0.09 * in.uv.y) * (1.0 + onset * 1.8) * bar_top_fade(in.uv.y);
     return vec4(
         frequency_color * strength * in.reflection_alpha,
         strength * in.reflection_alpha,
@@ -93,7 +93,7 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
     out.response = response;
-    out.reflection_alpha = reflection_alpha(peak, instance);
+    out.reflection_alpha = reflection_alpha(peak, instance) * peak_top_fade(bin);
     out.transient = 0.0;
     return out;
 }

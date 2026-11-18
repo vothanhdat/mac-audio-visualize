@@ -1,3 +1,4 @@
+mod frame_link;
 mod gpu;
 mod hybrid_matcher;
 mod multirate_fft;
@@ -11,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use frame_link::FrameLink;
 use gpu::GpuState;
 use visual_audio::audio::AudioInput;
 use window_state::{Frame, WindowState};
@@ -25,9 +27,12 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+const LIMITED_FRAME_RATE_WAKE: Duration = Duration::from_millis(250);
+
 struct App {
     audio: AudioInput,
     profile: Option<String>,
+    frame_link: FrameLink,
     window: Option<Arc<Window>>,
     controls_window: Option<Arc<Window>>,
     controls_visible: bool,
@@ -160,6 +165,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        self.frame_link.attach(&window);
         window.request_redraw();
         self.window = Some(window);
         self.controls_window = Some(controls_window);
@@ -323,6 +329,7 @@ impl ApplicationHandler for App {
         };
         let now = Instant::now();
         if self.occluded {
+            self.frame_link.set_rate(0);
             if now >= self.next_frame {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.drain_undrawn_audio(&self.audio.ring);
@@ -343,11 +350,18 @@ impl ApplicationHandler for App {
                 self.next_frame = now + IDLE_AUDIO_POLL_INTERVAL;
             }
             if gpu.idle_ready() {
+                self.frame_link.set_rate(0);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
                 return;
             }
             self.next_frame = now;
         }
+        let frame_rate_limit = self
+            .gpu
+            .as_ref()
+            .and_then(GpuState::frame_rate_limit)
+            .filter(|_| self.frame_link.is_attached());
+        self.frame_link.set_rate(frame_rate_limit.unwrap_or(0));
         if let Some(deadline) = self.interaction_until {
             if now >= deadline {
                 self.interaction_until = None;
@@ -357,6 +371,13 @@ impl ApplicationHandler for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 return;
             }
+        } else if frame_rate_limit.is_some() {
+            if self.frame_link.frame_due(now) {
+                window.request_redraw();
+            }
+            // Each tick of the link wakes the loop; this only covers pending saves.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + LIMITED_FRAME_RATE_WAKE));
+            return;
         } else if now >= self.next_frame {
             window.request_redraw();
             self.next_frame = now + self.frame_interval;
@@ -416,6 +437,7 @@ fn main() -> Result<()> {
         window_state,
         window_state_path,
         window_state_save_at: None,
+        frame_link: FrameLink::default(),
         window: None,
         controls_window: None,
         controls_visible: false,

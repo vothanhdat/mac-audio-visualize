@@ -311,6 +311,11 @@ can add up to three visual frames of FFT response delay.
   queue. GPU work is briefly deferred during live window movement and resize.
   Axis-label layout runs only within the ten-pixel-high text strip; overlay
   draws are scissored to that strip.
+- **Frame rate limit** can hold the visualizer at 60, 40, or 30 fps. A display
+  link keeps limited frames in step with the refresh. WindowServer's load
+  follows the number of frames shown, not the window's size or transparency.
+  Measured on a 120 Hz MacBook Pro, where WindowServer used about 15% with the
+  app closed: 44% at 120 fps, 42% at 60, 27% at 40, and 23% at 30.
 - While the visualizer window is fully hidden, rendering stops (macOS can
   withhold drawables for up to a second). The capture ring is still drained
   every 250 ms, and analyzers restart from the continuous history when the

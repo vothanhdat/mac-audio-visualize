@@ -220,6 +220,7 @@ struct VisualizerSettings {
     frequency_focus_strength_percent: f32,
     frequency_focus_origin_percent: f32,
     transparent_background: bool,
+    frame_rate_limit: FrameRateLimit,
     spectrum_palette: SpectrumPalette,
     palette_blend: PaletteBlend,
     /// Stops used when the palette is Custom, in any order.
@@ -523,6 +524,36 @@ enum BarLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FrameRateLimit {
+    Display,
+    Fps60,
+    Fps40,
+    Fps30,
+}
+
+impl FrameRateLimit {
+    const ALL: [Self; 4] = [Self::Display, Self::Fps60, Self::Fps40, Self::Fps30];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Display => "Display refresh",
+            Self::Fps60 => "60 fps",
+            Self::Fps40 => "40 fps",
+            Self::Fps30 => "30 fps",
+        }
+    }
+
+    fn frames_per_second(self) -> Option<u32> {
+        match self {
+            Self::Display => None,
+            Self::Fps60 => Some(60),
+            Self::Fps40 => Some(40),
+            Self::Fps30 => Some(30),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum AxisLabelMode {
     Notes,
     Hertz,
@@ -801,6 +832,7 @@ impl Default for VisualizerSettings {
             frequency_focus_strength_percent: 59.0,
             frequency_focus_origin_percent: 50.0,
             transparent_background: false,
+            frame_rate_limit: FrameRateLimit::Display,
             spectrum_palette: SpectrumPalette::Default,
             palette_blend: PaletteBlend::Rgb,
             custom_palette: SpectrumPalette::Default
@@ -2403,6 +2435,18 @@ fn draw_settings_panel(
                     "Transparent background",
                 );
                 ui.small("Converts rendered light into window transparency.");
+                egui::ComboBox::from_label("Frame rate limit")
+                    .selected_text(settings.frame_rate_limit.label())
+                    .show_ui(ui, |ui| {
+                        for limit in FrameRateLimit::ALL {
+                            ui.selectable_value(
+                                &mut settings.frame_rate_limit,
+                                limit,
+                                limit.label(),
+                            );
+                        }
+                    });
+                ui.small("Lower rates use less CPU here and in macOS WindowServer.");
                 if settings.render_mode == RenderMode::Flat {
                     ui.checkbox(&mut settings.bottom_mirror, "Bottom mirror");
                 }
@@ -3482,6 +3526,11 @@ impl GpuState {
 
     /// True once the newest audio has been silent long enough for every bar,
     /// peak, glow and trail to settle, so the frame on screen stays correct.
+    /// The chosen frame rate, or `None` to follow the display refresh.
+    pub fn frame_rate_limit(&self) -> Option<u32> {
+        self.settings.frame_rate_limit.frames_per_second()
+    }
+
     pub fn idle_ready(&self) -> bool {
         self.silence.settled(
             idle_settle_frames(&self.settings),
@@ -6140,6 +6189,13 @@ fn probe_palette(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(silence.since.is_none(), "restart must not start silence");
         silence.count_frame();
         assert_eq!(silence.frames, 0);
+    }
+
+    #[test]
+    fn settings_saved_before_the_frame_rate_limit_follow_the_display() {
+        let settings: VisualizerSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.frame_rate_limit, FrameRateLimit::Display);
+        assert_eq!(settings.frame_rate_limit.frames_per_second(), None);
     }
 
     #[test]

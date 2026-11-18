@@ -93,7 +93,7 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
     out.response = response;
-    out.reflection_alpha = reflection_alpha(peak, instance) * peak_top_fade(bin);
+    out.reflection_alpha = reflection_alpha(peak, instance);
     out.transient = 0.0;
     return out;
 }

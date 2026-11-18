@@ -579,36 +579,17 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 // bar, because equal ratios of light look like equal steps of brightness.
 const BAR_TOP_FADE_LOG2_RANGE = 8.304820;
 const BAR_TOP_FADE_FLOOR = 0.00316228;
-// At 100% fade, the gap between a bar and its peak marker that makes the
-// marker fully visible, as a fraction of the full level range.
-const PEAK_REVEAL_RANGE = 0.1;
 
-// Opacity at a position through the fade, from 0 (opaque) to 1 (gone). Easing
-// the position keeps both ends of the fade free of a visible crease, and
-// subtracting the floor makes the far end reach exactly zero.
-fn top_fade_curve(position: f32) -> f32 {
-    let eased = smoothstep(0.0, 1.0, position);
-    let light = exp2(-BAR_TOP_FADE_LOG2_RANGE * eased);
-    return (light - BAR_TOP_FADE_FLOOR) / (1.0 - BAR_TOP_FADE_FLOOR);
-}
-
+// Easing the position through the fade keeps both ends free of a visible
+// crease, and subtracting the floor makes the far end reach exactly zero.
 fn bar_top_fade(height: f32) -> f32 {
     let fade = params.db_scale.w;
     if (fade <= 0.0001) {
         return 1.0;
     }
-    return top_fade_curve((height - (1.0 - fade)) / fade);
-}
-
-// A marker resting on its bar would draw a hard line across the faded tip, so
-// it appears only as the bar falls away from it.
-fn peak_top_fade(bin: u32) -> f32 {
-    let fade = params.db_scale.w;
-    if (fade <= 0.0001) {
-        return 1.0;
-    }
-    let gap = spectrum[bin].z - spectrum[bin].x;
-    return top_fade_curve(1.0 - gap / (PEAK_REVEAL_RANGE * fade));
+    let eased = smoothstep(0.0, 1.0, (height - (1.0 - fade)) / fade);
+    let light = exp2(-BAR_TOP_FADE_LOG2_RANGE * eased);
+    return (light - BAR_TOP_FADE_FLOOR) / (1.0 - BAR_TOP_FADE_FLOOR);
 }
 
 fn shaded_bar(in: BarOut, face_kind: f32) -> vec4<f32> {
@@ -800,7 +781,7 @@ fn peak_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
     out.response = auxiliary[HIGHLIGHT_OFFSET + bin].z;
-    out.reflection_alpha = reflection_alpha(peak, instance) * peak_top_fade(bin);
+    out.reflection_alpha = reflection_alpha(peak, instance);
     out.transient = 0.0;
     return out;
 }
@@ -855,8 +836,7 @@ fn peak_volume_vs(
         clamp(render_channel.peak_depth_brightness_percent * 0.01, 0.0, 1.0);
     let rear_layer_alpha =
         depth_brightness * (0.33 + 0.67 * layer_t);
-    out.reflection_alpha =
-        select(rear_layer_alpha, 1.0, final_layer) * peak_top_fade(bin);
+    out.reflection_alpha = select(rear_layer_alpha, 1.0, final_layer);
     out.transient = 0.0;
     return out;
 }
@@ -903,7 +883,7 @@ fn peak_glow_vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) ins
     out.energy = peak;
     out.bin_t = f32(bin) / f32(params.bin_count - 1u);
     out.response = response;
-    out.reflection_alpha = reflection_alpha(peak, instance) * peak_top_fade(bin);
+    out.reflection_alpha = reflection_alpha(peak, instance);
     out.transient = 0.0;
     return out;
 }
